@@ -1,0 +1,9 @@
+data/
+output/
+figures/
+logs/
+*.nc
+*.csv
+__pycache__/
+*.ipynb_checkpoints/
+*.log

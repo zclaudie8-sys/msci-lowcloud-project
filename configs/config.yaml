@@ -1,0 +1,73 @@
+# =========================================================
+#  Project Configuration File
+#  Seasonal Low-Cloud Feedback Analysis (2003–2022)
+#  Author: Qirui Zhao
+#  ========================================================
+
+project:
+  name: "Seasonal Low-Cloud Feedback"
+  description: "Quantifying the seasonal LCF–EIS–SWCRE relationships to constrain climate sensitivity."
+  time_span: [2003, 2022]
+  regions: ["SEP", "SEA", "NEP", "NEA", "SEI"]
+
+data:
+  modis_path: "/gws/nopw/j04/csgap/ceppi/data/modis/5x5/"
+  ceres_path: "/gws/nopw/j04/csgap/ceppi/data/ceres/5x5/"   # LCRE 同在 modis 目录
+  ceres_vars:
+    SWCRE: {file: "EBAF_TOA_5x5_200003-202412.nc", var: "swcre"}
+    LWCRE: {file: "EBAF_TOA_5x5_200003-202412.nc", var: "lwcre"}
+    NET:   {file: "EBAF_TOA_5x5_200003-202412.nc", var: "net"}     # 若无 net，就先别写
+    LCRE:  {file: "LCRE_low_5x5_200207-202406.nc",  var: "lcre"}   # 只有你确实有“低云CRE”产品时才填
+  era5_path:  "/gws/nopw/j04/csgap/ceppi/data/era5/5x5/"
+  era5_vars:
+    EIS:  {file: "eislts_197901-202112.nc", var: "eislts"}   # 海上EIS/陆上LTS（Paulo同口径）
+    W500: {file: "wap500_197901-202112.nc", var: "wap"}      # 500hPa 竖直速度(ω, Pa/s)
+    TS:   {file: "ts_197901-202112.nc",     var: "ts"}       # 地表温度(陆:地表; 海:皮肤温度)
+    SST:  {file: "tos_197901-202212.nc",    var: "tos"}      # 海表温度(SST) — 注意不是 sstadv
+    U10:  {file: "ws_197901-202112.nc",     var: "ws"}       # 10米风速（若要分量可改成 uas/vas）
+    Q:    {file: "hur700_197901-202112.nc", var: "hur"}      
+  variables:
+    - name: "LCF"
+      source: "MODIS"
+      description: "Low Cloud Fraction (COSP-consistent)"
+    - name: "SWCRE"
+      source: "CERES"
+      description: "Shortwave Cloud Radiative Effect"
+    - name: "EIS"
+      source: "ERA5"
+      description: "Estimated Inversion Strength"
+
+analysis:
+  harmonic_fit:
+    order: 1
+    months: 12
+  regression:
+    method: "OLS"
+    robust: "Newey-West"
+    lag: 0
+  diagnostics:
+    - "phase_locking"
+    - "seasonal_amplitude"
+    - "cloud_feedback_lambda"
+
+output:
+
+  root: output
+  subdirs:
+    regional_monthly: regional_monthly
+    harmonics: harmonics
+    sensitivity_beta: sensitivity_beta
+    gamma: gamma
+    dLCF_dTs: dLCF_dTs
+    lambda: lambda
+    tables: tables
+    figures: figures
+    logs: logs
+  save_format: "png"
+
+regions:
+  SEP: [ -110, -70, -35, -15 ]
+  SEA: [ -30, 0,   50, 110 ]
+  NEP: [ 15, 30, -155, -115 ]
+  NEA: [ 15, 30,  -30,  15 ]
+  SEI: [ -30, 0,   90, 150 ]
