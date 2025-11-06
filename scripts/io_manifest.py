@@ -20,13 +20,10 @@ def load_manifest(path: str | Path | None) -> Optional[Manifest]:
     with manifest_path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
 
-    base_dir = str(manifest_path.parent.resolve())
-
     if isinstance(data, dict):
-        data.setdefault("__base_dir__", base_dir)
         return data
     if isinstance(data, list):
-        return {"artifacts": data, "__base_dir__": base_dir}
+        return {"artifacts": data}
     return None
 
 
@@ -70,19 +67,13 @@ def resolve_from_manifest(
         return []
 
     script_contains = want.get("script_contains")
-    if script_contains is None:
-        script_filters = []
-    elif isinstance(script_contains, str):
-        script_filters = [script_contains]
-    elif isinstance(script_contains, Iterable):
-        script_filters = list(script_contains)
-    else:
+    if script_contains:
         script_filters = [str(script_contains)]
+    else:
+        script_filters = []
 
     path_filters = want.get("path_like_contains") or []
-    if isinstance(path_filters, str):
-        path_filters = [path_filters]
-    elif not isinstance(path_filters, Iterable):
+    if not isinstance(path_filters, Iterable):
         path_filters = [path_filters]
 
     placeholders = want.get("placeholders") or {}
@@ -95,9 +86,6 @@ def resolve_from_manifest(
 
     artifact_type = want.get("artifact_type")
     results: List[str] = []
-    seen: set[str] = set()
-
-    base_dir = Path(manifest.get("__base_dir__", "."))
 
     for artifact in _iter_artifacts(manifest):
         path_value = artifact.get("path") or artifact.get("filepath") or artifact.get("file")
@@ -125,14 +113,6 @@ def resolve_from_manifest(
             else:
                 continue
 
-        candidate_path = Path(path_value)
-        if not candidate_path.is_absolute():
-            candidate_path = base_dir / candidate_path
-
-        normalized = str(candidate_path)
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        results.append(normalized)
+        results.append(path_value)
 
     return results

@@ -1,0 +1,413 @@
+script,function,artifact_type,path_pattern,root_constant,notes
+scripts/audit_outputs.py,main,other,<DIRECTORY>,,variable placeholder; directory creation
+scripts/audit_outputs.py,write_json,other,<HANDLE>,,variable placeholder
+scripts/audit_outputs.py,write_docs,other,- Figures should be written to `fig/` or `figures/` folders with informative names.,,heuristic string match
+scripts/audit_outputs.py,write_docs,other,- Prefer storing tabular data in `tables/` with descriptive filenames.,,heuristic string match
+scripts/audit_outputs.py,write_docs,other,- Use `output/` for derived datasets and diagnostics.,,heuristic string match
+scripts/audit_outputs.py,write_docs,log,- Write execution logs to `logs/` with timestamps or identifiers.,,heuristic string match
+scripts/audit_outputs.py,<module>,other,output/,,heuristic string match
+scripts/augment_modis_optics.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/augment_modis_optics.py,main,table,<OUT>,,variable placeholder
+scripts/dLCF_dTs_A_direct.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/dLCF_dTs_A_direct.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/dLCF_dTs_A_direct.py,main,table,<OUT_HARM>,,variable placeholder
+scripts/dLCF_dTs_A_direct.py,main,table,<TABLE4_PATH>,,variable placeholder
+scripts/dLCF_dTs_A_direct.py,main,table,<TABLE4_PATH>,,variable placeholder
+scripts/dLCF_dTs_A_direct.py,<module>,log,"
+A-line (direct) estimate of dLCF/dTs with meteorology controlled.
+
+Model (per calendar month m):
+    LCF'_m = theta_T^(m) * Ts'_m + sum_j theta_j^(m) * CCF'_{j,m} + eps_m
+
+Inputs (per region):
+  - output/regional_monthly/MODIS_<REGION>_monthly.csv   (need column MODIS_LCF; fallback to cllmodis_region_mean_*.csv)
+  - output/regional_monthly/ERA5_<REGION>_monthly.csv    (ERA5_TS / ERA5_SST / ERA5_EIS / ERA5_W500 / ...)
+
+Arguments:
+  --region NEP --ccf EIS,W500,SST,U10,Q --lags 1
+
+Outputs:
+  - output/dLCF_dTs/ALINE_<REGION>.csv        (month, dLCF_dTs, se, t, p, ci_low, ci_high, n, rsq, Ts_name)
+  - output/dLCF_dTs/ALINE_HARM_<REGION>.csv   (A, phase_deg, peak_month, r2, n_valid)
+  - (append/update) output/tables/Table4_dLCF_dTs_A.csv (region, mean±CI, A, phase_deg)
+
+Notes
+- Per-month Z-score (by calendar month) for LCF, Ts and all CCFs.
+- Ts predictor is chosen automatically:
+    * If user lists SST in --ccf, Ts = ERA5_SST and SST is removed from CCFs to avoid duplication.
+    * Else if ERA5_TS exists, Ts = ERA5_TS; else if ERA5_SST exists, Ts = ERA5_SST.
+- Newey–West (HAC) SE with lag = --lags (default 1).
+- VIF checked per month (info-level warning only).
+",,heuristic string match
+scripts/feedback_fit_cmip_vs_obs.py,setup_logger,log,<LOGS_DIR>,,variable placeholder; directory creation
+scripts/feedback_fit_cmip_vs_obs.py,make_scatter,other,<FIG_PATH_PARENT>,,attribute placeholder; directory creation
+scripts/feedback_fit_cmip_vs_obs.py,make_scatter,figure,<FIG_PATH>,,variable placeholder
+scripts/feedback_fit_cmip_vs_obs.py,process_region,other,<TABLE_PATH_PARENT>,,attribute placeholder; directory creation
+scripts/feedback_fit_cmip_vs_obs.py,process_region,table,<TABLE_PATH>,,variable placeholder
+scripts/feedback_fit_cmip_vs_obs.py,parse_args,table,output/cmip_amip_monthly_2003-2014.csv,,heuristic string match
+scripts/feedback_fit_cmip_vs_obs.py,process_region,other,output/regional_monthly,,heuristic string match
+scripts/feedback_fit_cmip_vs_obs_strict.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/feedback_fit_cmip_vs_obs_strict.py,plot_model_vs_obs,other,<FIG_PATH_PARENT>,,attribute placeholder; directory creation
+scripts/feedback_fit_cmip_vs_obs_strict.py,plot_model_vs_obs,figure,<FIG_PATH>,,variable placeholder
+scripts/feedback_fit_cmip_vs_obs_strict.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/feedback_fit_cmip_vs_obs_strict.py,main,table,<OUT_CSV_ALL>,,variable placeholder
+scripts/feedback_fit_cmip_vs_obs_strict.py,<module>,log,"
+feedback_fit_cmip_vs_obs_strict.py  (STRICT, config-aware, NO GUESSING)
+
+比较（默认 2003–2014，可用 --span 覆盖）：
+  (1) λ_cld,SW = d(SWCRE)/d(Ts)
+  (2) d(LCF)/d(EIS)
+
+读取优先级（严格按你的目录）：
+  1) CERES_<REGION>_monthly.csv   （SWCRE）
+     ERA5_<REGION>_monthly.csv    （Ts / EIS）
+     MODIS_<REGION>_monthly.csv   （LCF）
+  2) 回退：{prefix}_region_mean_{span}_{REGION}.csv
+          {prefix}_climatology_{span}_{REGION}.csv
+
+统计：
+  * y ~ β x + const
+  * HAC(Newey–West) 标准误（--hac-lags；--no-hac 关闭）
+  * AR(1) 报告：phi_y, phi_x, Ljung–Box(1) p 值（lb_p_y/x），Durbin–Watson（dw）
+
+输出：
+  * tables/feedback_fit_<y>_vs_<x>_<REGION>.csv
+  * figures/feedback_fit_<y>_vs_<x>_<SCOPE>.png
+  * logs/feedback_fit_*.log （由 setup_logger 写入）
+
+  python scripts/feedback_fit_cmip_vs_obs_strict.py   --pair swcre_ts   --config configs/config.yaml   --regions ALL   --span 2003-2022   --deseasonalize --hac-lags 12   --obs-map SWCRE=swcre,Ts=ts   --cmip-y output/tables/cmip_panel_clswlow_2003-2014.csv   --cmip-x output/tables/cmip_panel_ts_2003-2014.csv
+# 如果上一步生成的是 tas 面板，就把最后一行改成：
+# --cmip-x output/tables/cmip_panel_tas_2003-2014.csv
+
+
+
+",,heuristic string match
+scripts/feedback_fit_cmip_vs_obs_strict.py,parse_args,other,CMIP x 表（默认 output/cmip_amip_<x>_vs_obs_<span>.csv）,,heuristic string match
+scripts/feedback_fit_cmip_vs_obs_strict.py,parse_args,other,CMIP y 表（默认 output/cmip_amip_<y>_vs_obs_<span>.csv）,,heuristic string match
+scripts/feedback_fit_cmip_vs_obs_strict.py,main,other,output/cmip_amip_,,heuristic string match
+scripts/gamma_radiative.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/gamma_radiative.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/gamma_radiative.py,main,table,<OUT_HARM>,,variable placeholder
+scripts/gamma_radiative.py,main,table,<TABLE3_PATH>,,variable placeholder
+scripts/gamma_radiative.py,main,table,<TABLE3_PATH>,,variable placeholder
+scripts/gamma_radiative.py,main,figure,<FIG_PATH>,,variable placeholder
+scripts/gamma_radiative.py,_read_modis,other,"
+    优先读 output/regional_monthly/MODIS_<REGION>_monthly.csv（需包含 MODIS_LCF；可选 MODIS_TAU / MODIS_RE）。
+    若不存在，则回退到 cllmodis_region_mean_*_<REGION>.csv（两列或无表头），构造最小月表（仅 MODIS_LCF）。
+    ",,heuristic string match
+scripts/gamma_radiative.py,<module>,other,"
+Monthly radiative sensitivity:
+  SWCRE'_m = gamma^(m) * LCF'_m + eta_m
+Optionally binned by optical depth (TAU) or effective radius (RE):
+  gamma(m | bin)
+
+Inputs (per region):
+  - output/regional_monthly/MODIS_<REGION>_monthly.csv   (MODIS_LCF; optional MODIS_TAU / MODIS_RE)
+  - output/regional_monthly/CERES_<REGION>_monthly.csv   (CERES_SWCRE)
+
+Preprocessing:
+  - Align to month-start timestamps
+  - Per-month Z-score for both SWCRE and LCF (and bin variable if needed)
+  - OLS with Newey–West (HAC) SE (lag = --lags)
+
+Outputs:
+  - output/gamma/GAMMA_<REGION>.csv
+  - output/gamma/GAMMA_HARM_<REGION>.csv
+  - output/tables/Table3_gamma.csv   (append/update for this region; incl. mean±CI and A,phi)
+  - output/figures/Fig3_swcre_vs_lcf_<REGION>.png
+
+Usage:
+  python scripts/gamma_radiative.py --region NEP --lags 1
+  python scripts/gamma_radiative.py --region NEP --bin_by TAU --bins 3 --lags 1
+  # 单区，不分箱
+python scripts/gamma_radiative.py --region NEP --lags 1
+
+# 单区，分箱（τ 三分位）
+python scripts/gamma_radiative.py --region NEP --bin_by TAU --bins 3 --lags 1
+
+# 一次跑五区（不分箱）
+python scripts/gamma_radiative.py --regions ALL --lags 1
+
+# 一次跑五区（分箱）
+python scripts/gamma_radiative.py --regions ALL --bin_by RE --bins 4 --lags 1
+
+",,heuristic string match
+scripts/harmonic_summary_cmip_amip.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/harmonic_summary_cmip_amip.py,main,figure,<FIG1>,,variable placeholder
+scripts/harmonic_summary_cmip_amip.py,main,figure,<FIG1B>,,variable placeholder
+scripts/harmonic_summary_cmip_amip.py,main,figure,<FIG2>,,variable placeholder
+scripts/harmonic_summary_cmip_amip.py,main,figure,<FIG3>,,variable placeholder
+scripts/harmonic_summary_cmip_amip.py,<module>,other,"
+CMIP6 AMIP harmonic summary vs observations (5x5 monthly)
+
+功能：
+- 遍历 /cmip6/5x5/<var> 目录下 *_amip_*.nc 文件（不同模型）
+- 每个 模型×区域：区域均值 → 年份窗口 → 月气候态（12个月）→ 一阶谐波拟合
+- 同口径加载观测（MODIS 或 LCRE）
+- 产出：总表 CSV（tables/）+ 4 类图（figures/）
+
+用法示例：
+  python scripts/harmonic_summary_cmip_amip.py --var cllisccp
+  python scripts/harmonic_summary_cmip_amip.py --var clswlow --regions SEP,SEA,NEP
+  python scripts/harmonic_summary_cmip_amip.py --var cllisccp --start 2003 --end 2012
+",,heuristic string match
+scripts/harmonic_summary_obs.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/harmonic_summary_obs.py,main,figure,<AMP_FIG>,,variable placeholder
+scripts/harmonic_summary_obs.py,main,figure,<PEAK_FIG>,,variable placeholder
+scripts/harmonic_summary_obs.py,<module>,other,"
+Summarize first-harmonic fitting for MODIS observations across regions.
+
+Outputs (under output/ and figures/):
+  - output/<var>_harmonics_summary_<span>.csv
+  - figures/<var>_amplitude_summary_<span>.png
+  - figures/<var>_peakmonth_summary_<span>.png
+
+Usage:
+  python scripts/harmonic_summary_obs.py --var cllmodis
+  # 可选变量: cllmodis, clswlow, cllwlow
+",,heuristic string match
+scripts/harmonic_yearly_obs.py,main,other,<ROSE_DIR>,,variable placeholder; directory creation
+scripts/harmonic_yearly_obs.py,main,other,<HARMONICS_DIR>,,variable placeholder; directory creation
+scripts/harmonic_yearly_obs.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/harmonic_yearly_obs.py,<module>,other,"
+harmonic_yearly_obs.py
+
+逐年一阶谐波拟合（MODIS obs）→ 汇总每年的振幅 A_y 与相位 φ_y，并画相位玫瑰图与年度振幅折线。
+
+Outputs:
+  - output/harmonics/<var>_yearly_harmonics_<span>.csv
+      columns: region, year, n_months, amplitude, phase_deg, peak_month, r2
+  - figures/harmonics/<var>_phase_rose_<region>_<span>.png
+  - figures/harmonics/<var>_amp_timeseries_<region>_<span>.png
+
+Usage:
+  python scripts/harmonic_yearly_obs.py --var cllmodis
+  # options: --regions NEP,NEA,SEA,SEI,SEP  --min_months 8
+",,heuristic string match
+scripts/harmonic_yearly_obs.py,main,other,output/harmonics,,heuristic string match
+scripts/lambda_chain.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/lambda_chain.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/lambda_chain.py,main,table,<OUT_H>,,variable placeholder
+scripts/lambda_chain.py,main,table,<OUT_ATTR>,,variable placeholder
+scripts/lambda_chain.py,main,table,<T5>,,variable placeholder
+scripts/lambda_chain.py,main,table,<T5>,,variable placeholder
+scripts/lambda_chain.py,main,figure,<FIG_NAME>,,variable placeholder
+scripts/lambda_chain.py,<module>,other,"
+lambda_chain.py
+
+Compute monthly cloud feedback via product:
+    lambda_cld^(m) = gamma^(m) * (dLCF/dTs)^(m)
+and decompose month-to-month departures into gamma / dLCF_dTs / synergy.
+
+Reads:
+  - output/gamma/GAMMA_<REGION>__*.csv  (auto-pick binned_* or unbinned; use overall rows bin=NaN)
+  - output/dLCF_dTs/ALINE_<REGION>.csv  (A-line; column dLCF_dTs)
+  - output/dLCF_dTs/BCHAIN_<REGION>.csv (B-line; column dLCF_dTs_chain)
+
+Args:
+  --region NEP            # single region
+  --regions ALL|SEP,SEA   # run multiple
+  --method A|B|BOTH       # default BOTH
+
+Outputs per region:
+  - output/lambda/LAMBDA_<REGION>_A.csv, ..._B.csv
+  - output/lambda/LAMBDA_HARM_<REGION>_A.csv, ..._B.csv
+  - output/lambda/LAMBDA_ATTR_<REGION>_A.csv, ..._B.csv
+Table 5 (combined):
+  - output/tables/Table5_lambda.csv
+Figure 4:
+  - single region:  output/figures/Fig4_lambda_polar_<REGION>.png
+  - multi-region :  output/figures/Fig4_lambda_polar_obs_vs_model.png
+",,heuristic string match
+scripts/make_cmip_panel.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/make_cmip_panel.py,<module>,other,gws/nopw/j04/csgap/ceppi/data/cmip6/5x5,CMIP_ROOT,constant definition; Path constructor
+scripts/make_cmip_panel.py,main,table,<OUT>,,variable placeholder
+scripts/make_table1_harmonics.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/make_table1_harmonics.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/make_table1_harmonics.py,<module>,other,"
+Aggregate harmonics (A, phi) from output/harmonics/ into one tall table:
+  output/tables/Table1_harmonics_A_phi.csv
+
+It ingests:
+  - cllmodis_harmonics_*.csv
+  - clswlow_harmonics_*.csv, cllwlow_harmonics_*.csv
+  - ERA5_*_harmonics_*.csv
+  - CERES_*_harmonics_*.csv   (if present in future)
+
+Expected columns (robust to presence/absence of extras):
+  [""source"",""var"",""region"",""span"",""amplitude"",""phase_deg"",""R2"",""n_valid""]
+",,heuristic string match
+scripts/obs_periodogram_test.py,ensure_dirs,other,<P>,,variable placeholder; Path constructor; directory creation
+scripts/obs_periodogram_test.py,make_figure,figure,<OUT_PNG>,,variable placeholder
+scripts/obs_periodogram_test.py,run_one_region,table,<OUT_CSV>,,variable placeholder
+scripts/obs_periodogram_test.py,main,other,<OUT_DIR>,,variable placeholder; directory creation
+scripts/obs_periodogram_test.py,<module>,other,"
+obs_periodogram_test.py
+
+1) 读取 output/regional_monthly/cllmodis_mean_2003-2022_<REGION>.csv （需含列: month,value）
+2) 计算功率谱：
+   - 若月份等间隔且齐全（1..12），用 scipy.signal.periodogram (fs=1 month^-1)
+   - 否则自动用 Lomb–Scargle (scipy.signal.lombscargle)
+3) 拟合 AR(1) 系数 phi（基于 value 去均值后的 lag-1 自相关），构建红噪声谱：
+   P_red(f) = sigma2 * (1 - phi^2) / (1 + phi^2 - 2 phi cos(2π f))
+4) 用 2 自由度卡方近似给出 95% 阈值：P95(f) = P_red * chi2.ppf(0.95, 2) / 2
+   并在 f0 = 1/12 month^-1 处判断功率是否显著（p-value 也会给出）。
+5) 输出：
+   - 图：fig/periodogram_<REGION>.png （观测功率谱 + 红噪声谱 + 95% 阈值 + 年频率标记）
+   - 表：obs/periodogram_<REGION>.csv （列：freq, P_obs, P_red, p_value）
+
+依赖：pandas, numpy, scipy, matplotlib
+",,heuristic string match
+scripts/obs_periodogram_test.py,main,other,output/rednoisefile,,heuristic string match
+scripts/obs_periodogram_test.py,parse_args,table,output/regional_monthly/cllmodis_region_mean_2003-2022_{region}.csv,,heuristic string match
+scripts/region_mean_ceres.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/region_mean_ceres.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/region_mean_era5.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/region_mean_era5.py,main,table,<HARM_PATH>,,variable placeholder
+scripts/region_mean_era5.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/region_mean_era5.py,main,table,<SMALL_PATH>,,variable placeholder
+scripts/region_mean_modis.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/region_mean_modis.py,main,table,<OUT_NC>,,variable placeholder
+scripts/region_mean_modis.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/region_mean_modis.py,main,table,<OUT_CSV_CLIM>,,variable placeholder
+scripts/region_mean_modis.py,main,table,<OUT_CSV_FIT>,,variable placeholder
+scripts/region_mean_modis.py,<module>,log,"
+Compute regional mean time series, monthly climatology, and first-harmonic fit
+for MODIS/LCRE on Paulo's 5x5 monthly grids.
+
+Outputs (under output/):
+  - regional_monthly/<var>_region_mean_<span>_<REGION>.nc
+  - regional_monthly/<var>_region_mean_<span>_<REGION>.csv
+  - regional_monthly/<var>_climatology_<span>_<REGION>.csv
+  - harmonics/<var>_harmonics_<span>_<REGION>.csv
+
+Usage:
+  python scripts/region_mean_modis.py --region SEP --var cllmodis
+  # var: cllmodis, clswlow, cllwlow
+",,heuristic string match
+scripts/seasonal_consistency.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/seasonal_consistency.py,main,figure,<FIG_PATH>,,variable placeholder
+scripts/seasonal_consistency.py,<module>,log,"
+Seasonal consistency diagnostics (Shape / Amplitude / Phase) + Taylor diagram.
+
+Metrics per model (within a region):
+- Shape correlation r:
+    * raw   : Pearson r between 12-month climatologies (from tables file)
+    * harm  : correlation of first-harmonic reconstructions -> r_harm = cos(Δφ)
+- Amplitude:
+    * std_ratio ≈ σ_model / σ_obs      (proxy via harmonic amplitude ratio if std not available)
+    * A_ratio   = A_model / A_obs      (from tables file)
+- Phase:
+    * dphi = φ_model − φ_obs normalized to [−180°, 180°)
+
+Inputs:
+  - tables/cmip_amip_{var}_vs_obs_{span}.csv   (produced by harmonic_summary_cmip_amip.py)
+    required columns: ['model','region','amplitude_ratio','delta_phase_deg','corr_clim12',
+                       'A_model','A_obs','phi_model_deg','phi_obs_deg']
+
+Usage:
+  python scripts/seasonal_consistency.py --var cllisccp --region NEP --shape raw
+  python scripts/seasonal_consistency.py --var clswlow  --regions ALL --shape harm
+
+Outputs:
+  - output/tables/SEASONAL_consistency_{var}_{region}.csv        (per-model metrics)
+  - output/figures/Fig_Taylor_{var}_{region}.png                  (Taylor diagram)
+  - If --regions ALL: one CSV per region + one Taylor per region.
+",,heuristic string match
+scripts/seasonal_consistency_rank.py,ensure_dirs,other,<P>,,variable placeholder; Path constructor; directory creation
+scripts/seasonal_consistency_rank.py,plot_regionwise,figure,<OUT_PNG>,,variable placeholder
+scripts/seasonal_consistency_rank.py,plot_global_top,figure,<OUT_PNG>,,variable placeholder
+scripts/seasonal_consistency_rank.py,main,other,<FIG_DIR>,,variable placeholder; directory creation
+scripts/seasonal_consistency_rank.py,main,other,<TBL_DIR>,,variable placeholder; directory creation
+scripts/seasonal_consistency_rank.py,main,table,<OUT_CSV>,,variable placeholder
+scripts/seasonal_consistency_rank.py,<module>,other,"
+seasonal_consistency_rank.py
+============================
+
+用途
+----
+读取“季节一致性”统计结果，计算综合相似度分数 S，并输出：
+1) 每个区域的横向条形图（标注 Top-5） → figures/seasonal_rank_regionwise_<region>.png
+2) 全局 Top-K（默认10）横向条形图 → figures/seasonal_rank_global.png
+3) 汇总 CSV（各区域 S 与全局均分） → output/seasonal_rank_summary.csv
+
+分数定义
+--------
+S = (1/3)*r + (1/3)*(1 - |amp_ratio - 1|) + (1/3)*(1 - |dphi|/180)
+
+输入
+----
+默认从 --indir 目录读取所有 CSV（推荐传入 output/tables）。
+脚本自动兼容下列列名（不区分大小写）：
+- r:            直接列名 r，或 shape_r
+- amp_ratio:    直接列名 amp_ratio，或 A_ratio；若都没有但有 std_ratio，则以 std_ratio 近似 amp_ratio
+- dphi:         直接列名 dphi，或 dphi_deg，或 delta_phase_deg
+- region:       若表中没有 region 列，则从文件名推断（例如 SEASONAL_consistency_..._NEP.csv → NEP）
+
+快速使用
+--------
+python scripts/seasonal_consistency_rank.py --indir output/tables
+python scripts/seasonal_consistency_rank.py --indir output/tables --topk 15
+
+参数
+----
+--indir       输入目录（包含各区 CSV），默认 output/tables
+--outdir_fig  图输出目录（默认 output/figures）
+--outdir_tab  表输出目录（默认 output）
+--topk        全局 TopK 模型数量（默认 10）
+
+依赖
+----
+pandas, numpy, matplotlib
+",,heuristic string match
+scripts/seasonal_consistency_rank.py,main,other,output/figures,,heuristic string match
+scripts/seasonal_consistency_rank.py,parse_args,other,output/figures,,heuristic string match
+scripts/seasonal_consistency_rank.py,main,other,output/tables,,heuristic string match
+scripts/seasonal_consistency_rank.py,parse_args,other,output/tables,,heuristic string match
+scripts/sensitivity_beta.py,<module>,other,<HERE_PARENT>,ROOT,constant definition; attribute placeholder
+scripts/sensitivity_beta.py,main,table,<OUT_BETA>,,variable placeholder
+scripts/sensitivity_beta.py,main,table,<OUT_HARM>,,variable placeholder
+scripts/sensitivity_beta.py,main,table,<TABLE2_PATH>,,variable placeholder
+scripts/sensitivity_beta.py,main,table,<TABLE2_PATH>,,variable placeholder
+scripts/sensitivity_beta.py,main,figure,<FIG_PATH>,,variable placeholder
+scripts/sensitivity_beta.py,_read_modis_lcf,other,"
+    Prefer:  output/regional_monthly/MODIS_<REGION>_monthly.csv  (应含列 MODIS_LCF)
+    Fallback:cllmodis_region_mean_*_<REGION>.csv   (两列: time, value 或无表头)
+    返回: pd.Series(index=datetime, name='LCF')
+    ",,heuristic string match
+scripts/sensitivity_beta.py,<module>,other,"
+Seasonal (month-by-month) sensitivity:
+  LCF'_m = sum_j beta_j^(m) * CCF'_{j,m} + eps_m
+
+Inputs (per region):
+  - output/regional_monthly/MODIS_<REGION>_monthly.csv   (needs column MODIS_LCF; fallback to cllmodis_region_mean_*.csv)
+  - output/regional_monthly/ERA5_<REGION>_monthly.csv    (columns like ERA5_EIS, ERA5_W500, ERA5_SST, ERA5_TS, ERA5_U10, ERA5_Q)
+
+Preprocessing:
+  - For each calendar month m (1..12), z-score LCF and every CCF using that month's (across years) mean/std
+  - Check multicollinearity via VIF (warn if > 5)
+  - OLS with Newey–West (HAC) standard errors (lag = --lags)
+
+Outputs:
+  - output/sensitivity_beta/BETA_<REGION>.csv
+      columns: month,var,beta,se,t,p,ci_low,ci_high,n,rsq
+  - output/sensitivity_beta/BETA_HARM_<REGION>.csv
+      columns: var,A,phase_deg,peak_month,r2_beta,n_valid
+  - output/tables/Table2_beta.csv  (append/update one row per var per region)
+      columns: region,var,beta_mean,beta_ci_low,beta_ci_high,A,phase_deg
+  - output/figures/Fig2_beta_stripes_<REGION>.png  (variables x 12 months heatmap-like stripes)
+
+Usage:
+  python scripts/sensitivity_beta.py --region NEP --ccf EIS,W500,SST,U10,Q --lags 1
+  # ΔSST 可写成 DSST 或 ΔSST
+",,heuristic string match
+scripts/utils_config.py,_ensure_output_tree,other,<ROOT>/<V>,,variable placeholder; Path constructor; directory creation
+scripts/utils_config.py,get_outdir,other,<P>,,variable placeholder; directory creation
+scripts/utils_config.py,_ensure_output_tree,log,"
+    统一输出目录结构：
+      output/
+        regional_monthly/  harmonics/  sensitivity_beta/  gamma/  dLCF_dTs/
+        lambda/  tables/  figures/  logs/
+    允许老配置的 results_dir/figures_dir/logs_dir 共存（向后兼容）。
+    ",,heuristic string match
+scripts/utils_config.py,make_output_path,other,返回 output/<kind>/<name> 的完整路径。,,heuristic string match
