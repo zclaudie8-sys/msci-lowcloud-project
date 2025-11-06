@@ -289,10 +289,7 @@ def run_hac_regression(
 
 def load_cmip_table(path: Path, metric_cfg: MetricConfig) -> pd.DataFrame:
     if not path.exists():
-        raise FileNotFoundError(
-            f"CMIP table not found at '{path}'. "
-            "Provide the correct location via --cmip-csv."
-        )
+        raise FileNotFoundError(path)
 
     df = pd.read_csv(path)
     columns_lower = {c.lower(): c for c in df.columns}
