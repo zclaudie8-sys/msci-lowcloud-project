@@ -1,271 +1,580 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""Compute OBS vs CMIP6 AMIP feedback fits over 2003–2014.
+
+This script estimates two metrics on a regional basis using monthly anomalies:
+
+* ``lambda_sw``: shortwave low-cloud feedback (dSWCRE / dTs).
+* ``dLCF_dEIS``: stability–low-cloud sensitivity (dLCF / dEIS).
+
+Monthly anomalies are computed by removing the calendar-month climatology over
+2003–2014 for each dataset (OBS, individual CMIP models). Ordinary least
+squares regressions are fitted with Newey–West (HAC) standard errors. Outputs
+include per-region tables, diagnostic scatter plots, and logs documenting the
+processing steps.
 """
-feedback_fit_cmip_vs_obs.py
-
-比较观测与 CMIP6 AMIP 模型在 2003–2014 年的两类反馈/敏感度：
-1) λ_cld,SW = d(SWCRE)/d(Ts)            （短波低云辐射反馈）
-2) d(LCF)/d(EIS)                         （稳定度—低云量敏感度）
-
-输入（默认文件模板，可用 --indir_* 参数覆盖）：
-- 观测 OBS（需为月度序列 CSV）：
-  output/regional_monthly/{var}_mean_2003-2014_<REGION>.csv
-  以及对应的预测变量：
-    * var in [swcre, clswlow]  -> ts_mean_2003-2014_<REGION>.csv
-    * var == cllmodis          -> eislts_mean_2003-2014_<REGION>.csv
-- 模式 CMIP：
-  * 模型名列表来源：output/cmip_amip_{var}_vs_obs_2003-2014.csv
-  * 每个模型的月度序列放在：
-    output/regional_monthly/cmip_amip/{MODEL}_{var}_mean_2003-2014_<REGION>.csv
-    和
-    output/regional_monthly/cmip_amip/{MODEL}_{predictor}_mean_2003-2014_<REGION>.csv
-
-输出：
-- 表：   output/tables/feedback_fit_<var>_<region>.csv
-- 图：   output/figures/feedback_fit_<var>_<region>.png
-- 日志： output/logs/feedback_fit_*.log
-
-回归方法：
-- OLS + Newey–West(HAC) 标准误，maxlags=--lags（默认 1）
-- 结果包含：b, SE_HAC, t, p, R², n, sign, dataset, model
-
-依赖：pandas, numpy, matplotlib, statsmodels
-"""
-
 from __future__ import annotations
-from pathlib import Path
+
 import argparse
+import logging
 import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Optional
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import logging
-from logging.handlers import RotatingFileHandler
 import statsmodels.api as sm
 
 
-# -------------------------- 日志 --------------------------
-def setup_logger(name: str, outdir_log: Path) -> logging.Logger:
-    outdir_log.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger(name)
+DEFAULT_REGIONS = ["SEP", "SEA", "NEP", "NEA", "SEI"]
+REGION_COLORS = {
+    "SEP": "#1f77b4",
+    "SEA": "#ff7f0e",
+    "NEP": "#2ca02c",
+    "NEA": "#d62728",
+    "SEI": "#9467bd",
+}
+
+
+@dataclass(frozen=True)
+class MetricConfig:
+    key: str
+    obs_y: str
+    obs_x: str
+    cmip_y: str
+    cmip_x: str
+    title: str
+    unit_label: str
+    scale_factor: float
+
+
+METRIC_CONFIG: Dict[str, MetricConfig] = {
+    "lambda_sw": MetricConfig(
+        key="lambda_sw",
+        obs_y="swcre",
+        obs_x="ts",
+        cmip_y="swcre",
+        cmip_x="ts",
+        title="λ_cld,SW",
+        unit_label="W m$^{-2}$ K$^{-1}$",
+        scale_factor=1.0,
+    ),
+    "dLCF_dEIS": MetricConfig(
+        key="dLCF_dEIS",
+        obs_y="cllmodis",
+        obs_x="eislts",
+        cmip_y="lcf",
+        cmip_x="eis",
+        title="dLCF/dEIS",
+        unit_label="% K$^{-1}$",
+        scale_factor=100.0,
+    ),
+}
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Compare OBS vs CMIP6 AMIP feedback fits (2003–2014)."
+    )
+    parser.add_argument(
+        "--metric",
+        required=True,
+        choices=list(METRIC_CONFIG.keys()),
+        help="Metric to evaluate (lambda_sw or dLCF_dEIS).",
+    )
+    parser.add_argument(
+        "--regions",
+        help="Comma separated list of regions (default: all available).",
+    )
+    parser.add_argument(
+        "--cmip-csv",
+        default="output/cmip_amip_monthly_2003-2014.csv",
+        help="Path to CMIP6 AMIP monthly stacked table (2003–2014).",
+    )
+    parser.add_argument(
+        "--hac-lags",
+        type=int,
+        default=12,
+        help="Maximum lag for Newey–West HAC estimator (default: 12).",
+    )
+    return parser.parse_args()
+
+
+def load_regions(regions_arg: Optional[str]) -> List[str]:
+    if regions_arg:
+        return [r.strip().upper() for r in regions_arg.split(",") if r.strip()]
+
+    cfg_path = Path("configs/regions.yaml")
+    if cfg_path.exists():
+        try:
+            import yaml  # type: ignore
+
+            data = yaml.safe_load(cfg_path.read_text())
+            if isinstance(data, dict):
+                return [str(key).upper() for key in data.keys()]
+        except Exception:
+            pass
+
+    cfg_yaml = Path("configs/config.yaml")
+    if cfg_yaml.exists():
+        try:
+            import yaml  # type: ignore
+
+            data = yaml.safe_load(cfg_yaml.read_text())
+            if isinstance(data, dict):
+                if "regions" in data and isinstance(data["regions"], dict):
+                    return [str(k).upper() for k in data["regions"].keys()]
+                project = data.get("project")
+                if isinstance(project, dict) and isinstance(project.get("regions"), list):
+                    return [str(r).upper() for r in project["regions"]]
+        except Exception:
+            pass
+
+    return DEFAULT_REGIONS.copy()
+
+
+def setup_logger(metric: str, region: str, logs_dir: Path) -> logging.Logger:
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    logger_name = f"feedback_fit_{metric}_{region}"
+    logger = logging.getLogger(logger_name)
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-    fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(name)s - %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
-    fh = RotatingFileHandler(outdir_log / f"{name}.log", maxBytes=5_000_000, backupCount=3)
-    fh.setFormatter(fmt); fh.setLevel(logging.INFO)
-    sh = logging.StreamHandler(); sh.setFormatter(fmt); sh.setLevel(logging.INFO)
-    logger.addHandler(fh); logger.addHandler(sh)
-    logger.info(f"Logger started. Writing to: {outdir_log}")
+    formatter = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S"
+    )
+    file_handler = logging.FileHandler(logs_dir / f"feedback_fit_{metric}_{region}.log")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
     return logger
 
 
-# -------------------------- 参数 --------------------------
-def parse_args():
-    p = argparse.ArgumentParser(description="Compare feedback/sensitivity fits: obs vs CMIP AMIP (2003–2014).")
-    p.add_argument("--region", required=True, help="NEP/NEA/SEP/SEA/SEI")
-    p.add_argument("--var", required=True, choices=["swcre", "clswlow", "cllmodis"],
-                   help="目标：swcre/clswlow -> d(SWCRE)/d(Ts); cllmodis -> d(LCF)/d(EIS)")
-    p.add_argument("--lags", type=int, default=1, help="Newey–West(HAC) maxlags (default=1)")
-    # I/O 覆盖（可不改）
-    p.add_argument("--indir_obs", default="output/regional_monthly", help="观测月表目录")
-    p.add_argument("--indir_modellist", default="output", help="CMIP 模型列表文件所在的根目录")
-    p.add_argument("--indir_cmip_series", default="output/regional_monthly/cmip_amip",
-                   help="CMIP 模型的月表目录")
-    p.add_argument("--out_tables", default="output/tables", help="输出表目录")
-    p.add_argument("--out_figs", default="output/figures", help="输出图目录")
-    p.add_argument("--out_logs", default="output/logs", help="日志目录")
-    return p.parse_args()
+def find_case_insensitive(directory: Path, filename: str) -> Path:
+    target = filename.lower()
+    for path in directory.iterdir():
+        if path.name.lower() == target:
+            return path
+    raise FileNotFoundError(f"File not found (case-insensitive match): {filename}")
 
 
-# -------------------------- 工具函数 --------------------------
-def log_info(logger: logging.Logger, msg: str):
-    logger.info(msg); print(msg)
-
-def read_two_col_csv(path: Path, logger: logging.Logger) -> pd.Series:
-    """读取两列或可识别列的 CSV（时间/月份列 + 值列），返回按月份排序的 pd.Series。"""
+def read_monthly_csv(path: Path, logger: logging.Logger) -> pd.DataFrame:
     if not path.exists():
-        raise FileNotFoundError(str(path))
+        raise FileNotFoundError(path)
+
     df = pd.read_csv(path)
-    cols = {c.lower(): c for c in df.columns}
-    # 尝试识别列名
-    tcol = cols.get("time") or cols.get("month") or cols.get("m") or list(df.columns)[0]
-    vcol = None
-    for key in ["value", "val", "y", "series", "climate", "mean", "data"]:
-        if key in cols:
-            vcol = cols[key]; break
-    if vcol is None:
-        # 退化：取非时间列里最后一列
-        non_time = [c for c in df.columns if c != tcol]
-        vcol = non_time[-1]
-    s = df[[tcol, vcol]].dropna()
-    s.columns = ["t", "v"]
-    # 若 t 是 yyyy-mm 列，取月份序（2003-01 → 1 ... 2003-12 → 12 ...）
-    try:
-        t = pd.to_datetime(s["t"])
-        mseq = (t.dt.year - t.dt.year.min()) * 12 + t.dt.month  # 连续月序
-        s = pd.Series(s["v"].values, index=mseq.values, name="value")
-    except Exception:
-        # 如果本就是 1..N 的月份序/索引
-        s = pd.Series(s["v"].values, index=pd.to_numeric(s["t"], errors="coerce"), name="value")
-    s = s.sort_index()
-    logger.info(f"Read {path.name}: {len(s)} points")
-    return s
+    if df.empty:
+        logger.warning(f"{path} is empty.")
+        return pd.DataFrame(columns=["time", "value"])
 
-def hac_fit(y: pd.Series, x: pd.Series, lags: int):
-    """OLS + HAC 标准误；返回 dict：b, se, t, p, rsq, n。"""
-    df = pd.concat([y.rename("y"), x.rename("x")], axis=1).dropna()
-    n = len(df)
-    if n < 8:
-        return None
-    X = sm.add_constant(df["x"].values)
-    mod = sm.OLS(df["y"].values, X).fit(cov_type="HAC", cov_kwds={"maxlags": lags})
-    b = float(mod.params[1]); se = float(mod.bse[1]); t = float(mod.tvalues[1]); p = float(mod.pvalues[1])
-    rsq = float(mod.rsquared)
-    return {"b": b, "se": se, "t": t, "p": p, "rsq": rsq, "n": n, "sign": (p < 0.05)}
+    columns_lower = {c.lower(): c for c in df.columns}
 
+    time_col = None
+    for candidate in ("time", "date", "month"):
+        if candidate in columns_lower:
+            time_col = columns_lower[candidate]
+            break
+    if time_col is None:
+        time_col = df.columns[0]
 
-# -------------------------- 主逻辑 --------------------------
-def main():
-    args = parse_args()
-    region = args.region.upper()
-    var = args.var.lower()
-    lags = int(args.lags)
+    value_col = None
+    for candidate in ("value", "val", "mean", "data", "series", "climate"):
+        if candidate in columns_lower:
+            value_col = columns_lower[candidate]
+            break
+    if value_col is None:
+        non_time = [c for c in df.columns if c != time_col]
+        if not non_time:
+            raise ValueError(f"Unable to identify value column in {path}.")
+        value_col = non_time[-1]
 
-    outdir_tab = Path(args.out_tables); outdir_tab.mkdir(parents=True, exist_ok=True)
-    outdir_fig = Path(args.out_figs);   outdir_fig.mkdir(parents=True, exist_ok=True)
-    outdir_log = Path(args.out_logs)
+    df = df[[time_col, value_col]].copy()
+    df.columns = ["time", "value"]
 
-    logger = setup_logger(f"feedback_fit_{var}_{region}", outdir_log)
-    log_info(logger, f"[CONFIG] var={var}, region={region}, lags={lags}")
-
-    # 变量映射：被解释变量 y 及其预测量 predictor
-    # swcre/clswlow -> ts ; cllmodis -> eislts
-    if var in ["swcre", "clswlow"]:
-        y_name_obs = "swcre" if var == "swcre" else "clswlow"
-        x_name_obs = "ts"
-        ylabel = "SWCRE (W m⁻²)"
-        xlabel = "Ts (K)"
-        var_label = "lambda_cld_SW"
-    elif var == "cllmodis":
-        y_name_obs = "cllmodis"
-        x_name_obs = "eislts"
-        ylabel = "LCF (%)"
-        xlabel = "EIS (K)"
-        var_label = "dLCF_dEIS"
-    else:
-        raise SystemExit("Unknown var")
-
-    # ---------- 读取观测 ----------
-    obs_dir = Path(args.indir_obs)
-
-    # y (被解释变量)
-    obs_y_file = obs_dir / f"{y_name_obs}_mean_2003-2014_{region}.csv"
-    obs_y = read_two_col_csv(obs_y_file, logger)
-
-    # x (预测变量)
-    obs_x_file = obs_dir / f"{x_name_obs}_mean_2003-2014_{region}.csv"
-    obs_x = read_two_col_csv(obs_x_file, logger)
-
-    # HAC 拟合（观测）
-    obs_fit = hac_fit(obs_y, obs_x, lags)
-    if obs_fit is None:
-        raise SystemExit("Not enough OBS samples for regression.")
-
-    obs_row = {
-        "dataset": "OBS", "model": "OBS", "region": region, "var": var_label,
-        **obs_fit
-    }
-    logger.info(f"[OBS] b={obs_fit['b']:.3f} ± {obs_fit['se']:.3f}, R²={obs_fit['rsq']:.3f}, n={obs_fit['n']}")
-
-    # ---------- 读取模型名列表 ----------
-    # 用 cmip_amip_{var}_vs_obs_2003-2014.csv 仅提取 model 列
-    model_list_file = Path(args.indir_modellist) / f"cmip_amip_{var}_vs_obs_2003-2014.csv"
-    if not model_list_file.exists():
-        logger.warning(f"Model list file not found: {model_list_file}. Will try to discover series from directory.")
-        models = sorted({p.name.split("_")[0] for p in Path(args.indir_cmip_series).glob(f"*_{y_name_obs}_mean_2003-2014_{region}.csv")})
-    else:
-        df_ml = pd.read_csv(model_list_file)
-        if "model" in df_ml.columns:
-            models = sorted(set(df_ml["model"].astype(str)))
+    time_parsed = pd.to_datetime(df["time"], errors="coerce")
+    if time_parsed.isna().all():
+        if {"year", "month"}.issubset(columns_lower):
+            year_col = columns_lower["year"]
+            month_col = columns_lower["month"]
+            df["time"] = pd.to_datetime(
+                {
+                    "year": pd.to_numeric(df[year_col], errors="coerce").astype("Int64"),
+                    "month": pd.to_numeric(df[month_col], errors="coerce").astype("Int64"),
+                    "day": 1,
+                }
+            )
         else:
-            models = sorted({p.name.split("_")[0] for p in Path(args.indir_cmip_series).glob(f"*_{y_name_obs}_mean_2003-2014_{region}.csv")})
-    logger.info(f"[MODELS] found {len(models)} candidate models")
-
-    # ---------- 遍历模型 ----------
-    rows = [obs_row]
-    skipped = 0
-    for m in models:
-        y_path = Path(args.indir_cmip_series) / f"{m}_{y_name_obs}_mean_2003-2014_{region}.csv"
-        x_path = Path(args.indir_cmip_series) / f"{m}_{x_name_obs}_mean_2003-2014_{region}.csv"
-        if not y_path.exists() or not x_path.exists():
-            logger.warning(f"skip {m}: series missing -> {y_path.exists()=}, {x_path.exists()=}")
-            skipped += 1
-            continue
-        y = read_two_col_csv(y_path, logger)
-        x = read_two_col_csv(x_path, logger)
-        fit = hac_fit(y, x, lags)
-        if fit is None:
-            logger.warning(f"skip {m}: insufficient samples after dropna")
-            skipped += 1
-            continue
-        row = {"dataset": "MODEL", "model": m, "region": region, "var": var_label, **fit}
-        rows.append(row)
-
-    logger.info(f"[SUMMARY] models processed: {len(rows)-1}, skipped: {skipped}")
-
-    # ---------- 输出表 ----------
-    out_df = pd.DataFrame(rows)
-    out_csv = outdir_tab / f"feedback_fit_{var}_{region}.csv"
-    out_df.to_csv(out_csv, index=False)
-    logger.info(f"Saved table -> {out_csv}")
-
-    # ---------- 作图（b_model vs b_obs，含误差条） ----------
-    df_model = out_df[out_df["dataset"] == "MODEL"].copy()
-    if not df_model.empty:
-        b_obs = obs_fit["b"]; se_obs = obs_fit["se"]
-        xvals = np.full(len(df_model), b_obs)
-        yvals = df_model["b"].values
-        yerr  = df_model["se"].values
-        # 1:1 参考线（斜率=1，过原点）——在 x 轴上以 b 为单位
-        # 我们将把 x、y 都以“斜率 b”为轴，绘 (b_obs, b_model)
-        lim_min = min(np.min(yvals - yerr), b_obs - se_obs) - 0.1*abs(b_obs)
-        lim_max = max(np.max(yvals + yerr), b_obs + se_obs) + 0.1*abs(b_obs)
-        if lim_min == lim_max:
-            lim_min -= 1.0; lim_max += 1.0
-
-        plt.figure(figsize=(7.2, 6.2))
-        # 观测（竖线+误差区间）
-        plt.axvline(b_obs, color="k", lw=1.2, ls="--", alpha=0.8, label="OBS b")
-        plt.fill_betweenx([lim_min, lim_max], b_obs - se_obs, b_obs + se_obs, color="gray", alpha=0.15)
-
-        # 模型点（颜色按 region，可选，这里同一 region 一个颜色）
-        plt.errorbar(xvals, yvals, yerr=yerr, fmt="o", ms=5, mfc="#1f77b4", mec="none",
-                     ecolor="#1f77b4", elinewidth=1.0, capsize=2.5, alpha=0.9, label="MODEL b ± SE")
-
-        # 1:1 线（把 y=x 映射到当前坐标）
-        xs = np.linspace(lim_min, lim_max, 200)
-        plt.plot(xs, xs, color="orange", lw=1.2, alpha=0.8, label="1:1 line")
-
-        # 美化
-        plt.xlim(lim_min, lim_max); plt.ylim(lim_min, lim_max)
-        plt.xlabel(f"b_obs  ({var_label})")
-        plt.ylabel(f"b_model ({var_label})")
-        plt.title(f"Feedback fit ({var_label}) | {region} | 2003–2014  (HAC lags={lags})")
-        plt.grid(alpha=0.25, ls=":")
-        plt.legend(frameon=False, fontsize=9, loc="upper left")
-
-        # 模型名标注（轻度避免重叠）
-        for xi, yi, name in zip(xvals, yvals, df_model["model"].values):
-            plt.text(xi + 0.01*(lim_max-lim_min), yi, name, fontsize=7.5, va="center", alpha=0.85)
-
-        fig_path = outdir_fig / f"feedback_fit_{var}_{region}.png"
-        plt.tight_layout(); plt.savefig(fig_path, dpi=300, bbox_inches="tight"); plt.close()
-        logger.info(f"Saved figure -> {fig_path}")
+            raise ValueError(
+                f"Time column in {path} could not be parsed to datetime; provide YYYY-MM format."
+            )
     else:
-        logger.warning("No MODEL rows -> skip figure.")
+        df["time"] = time_parsed
 
-    logger.info("DONE.")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna(subset=["time", "value"]).sort_values("time")
+    df = df[(df["time"].dt.year >= 2003) & (df["time"].dt.year <= 2014)]
+    df = df.groupby("time", as_index=False)["value"].mean()
+
+    logger.info(f"Read {path.name}: {len(df)} monthly records (2003–2014 filter).")
+    return df
+
+
+def compute_anomalies(df: pd.DataFrame) -> pd.Series:
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    series = df.set_index("time")["value"].sort_index()
+    climatology = series.groupby(series.index.month).transform("mean")
+    anomalies = series - climatology
+    return anomalies
+
+
+def build_anomaly_pair(
+    y_df: pd.DataFrame,
+    x_df: pd.DataFrame,
+    dataset_label: str,
+    logger: logging.Logger,
+) -> pd.DataFrame:
+    y_anom = compute_anomalies(y_df)
+    x_anom = compute_anomalies(x_df)
+    paired = pd.concat([y_anom.rename("y"), x_anom.rename("x")], axis=1).dropna()
+    logger.info(
+        f"Built monthly anomalies over 2003–2014 for {dataset_label}: n={len(paired)}"
+    )
+    return paired
+
+
+def run_hac_regression(
+    paired: pd.DataFrame,
+    dataset_label: str,
+    hac_lags: int,
+    scale_factor: float,
+    logger: logging.Logger,
+) -> Optional[Dict[str, float]]:
+    n_samples = len(paired)
+    if n_samples < 24:
+        logger.warning(
+            f"{dataset_label}: insufficient paired samples after anomaly alignment (n={n_samples})."
+        )
+        return None
+
+    X = sm.add_constant(paired["x"].values)
+    model = sm.OLS(paired["y"].values, X).fit(
+        cov_type="HAC", cov_kwds={"maxlags": hac_lags}
+    )
+
+    slope = float(model.params[1]) * scale_factor
+    se_hac = float(model.bse[1]) * scale_factor
+    t_val = float(model.tvalues[1])
+    p_val = float(model.pvalues[1])
+    r_sq = float(model.rsquared)
+
+    logger.info(
+        f"{dataset_label} OLS(HAC lags={hac_lags}): "
+        f"b={slope:.4f}, SE={se_hac:.4f}, t={t_val:.3f}, p={p_val:.3f}, R2={r_sq:.3f}, n={n_samples}"
+    )
+
+    return {
+        "b": slope,
+        "SE_HAC": se_hac,
+        "t": t_val,
+        "p": p_val,
+        "R2": r_sq,
+        "n": n_samples,
+        "sign": bool(p_val < 0.05),
+    }
+
+
+def load_cmip_table(path: Path, metric_cfg: MetricConfig) -> pd.DataFrame:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"CMIP table not found at '{path}'. "
+            "Provide the correct location via --cmip-csv."
+        )
+
+    df = pd.read_csv(path)
+    columns_lower = {c.lower(): c for c in df.columns}
+
+    def get_column(name: str) -> str:
+        key = name.lower()
+        if key in columns_lower:
+            return columns_lower[key]
+        raise KeyError(f"Column '{name}' not found in CMIP table.")
+
+    rename_map = {
+        get_column("model"): "model",
+        get_column("region"): "region",
+    }
+
+    time_col = None
+    for candidate in ("time", "date"):
+        if candidate in columns_lower:
+            time_col = columns_lower[candidate]
+            break
+    if time_col:
+        rename_map[time_col] = "time"
+    else:
+        if "month" in columns_lower:
+            rename_map[columns_lower["month"]] = "month"
+        if "year" in columns_lower:
+            rename_map[columns_lower["year"]] = "year"
+
+    rename_map[get_column(metric_cfg.cmip_y)] = "y"
+    rename_map[get_column(metric_cfg.cmip_x)] = "x"
+
+    if "family" in columns_lower:
+        rename_map[columns_lower["family"]] = "family"
+
+    df = df.rename(columns=rename_map)
+
+    if "time" in df.columns:
+        df["time"] = pd.to_datetime(df["time"], errors="coerce")
+    elif {"year", "month"}.issubset(df.columns):
+        df["time"] = pd.to_datetime(
+            {
+                "year": pd.to_numeric(df["year"], errors="coerce").astype("Int64"),
+                "month": pd.to_numeric(df["month"], errors="coerce").astype("Int64"),
+                "day": 1,
+            }
+        )
+    else:
+        raise ValueError(
+            "CMIP table must contain a parseable 'time' column or both 'year' and 'month' columns."
+        )
+
+    df["model"] = df["model"].astype(str)
+    df["region"] = df["region"].astype(str)
+    df["x"] = pd.to_numeric(df["x"], errors="coerce")
+    df["y"] = pd.to_numeric(df["y"], errors="coerce")
+
+    df = df.dropna(subset=["time"])  # drop rows with invalid dates
+    df = df[(df["time"].dt.year >= 2003) & (df["time"].dt.year <= 2014)]
+
+    keep_cols = ["model", "region", "time", "y", "x"]
+    if "family" in df.columns:
+        keep_cols.append("family")
+    df = df[keep_cols]
+
+    df["region"] = df["region"].str.upper()
+    df = df.sort_values(["model", "region", "time"])
+    return df
+
+
+def make_scatter(
+    region: str,
+    metric_cfg: MetricConfig,
+    obs_row: Dict[str, float],
+    model_rows: List[Dict[str, float]],
+    plot_info: Dict[str, Optional[str]],
+    fig_path: Path,
+    single_region: bool,
+    logger: logging.Logger,
+) -> None:
+    fig_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    obs_b = obs_row["b"]
+    obs_se = obs_row["SE_HAC"]
+
+    if model_rows:
+        y_vals = np.array([row["b"] for row in model_rows], dtype=float)
+        y_err = np.array([row["SE_HAC"] for row in model_rows], dtype=float)
+        x_vals = np.full_like(y_vals, obs_b)
+        x_err = np.full_like(y_vals, obs_se)
+
+        families = [plot_info.get(row["model"], None) for row in model_rows]
+        unique_families = [f for f in sorted(set(families)) if f]
+
+        if single_region and unique_families:
+            cmap = plt.get_cmap("tab10")
+            color_map = {
+                fam: cmap(i % cmap.N) for i, fam in enumerate(unique_families)
+            }
+            colors = [color_map.get(fam, REGION_COLORS.get(region, "#1f77b4")) for fam in families]
+            handles = []
+            labels_added = set()
+            for x, y, xe, ye, color, model_name, fam in zip(
+                x_vals, y_vals, x_err, y_err, colors, [row["model"] for row in model_rows], families
+            ):
+                ax.errorbar(
+                    x,
+                    y,
+                    xerr=xe,
+                    yerr=ye,
+                    fmt="o",
+                    color=color,
+                    ecolor=color,
+                    elinewidth=1.0,
+                    capsize=3,
+                    label=fam if fam and fam not in labels_added else None,
+                )
+                if fam and fam not in labels_added:
+                    handles.append(ax.plot([], [], "o", color=color, label=fam)[0])
+                    labels_added.add(fam)
+                ax.annotate(model_name, (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8)
+            if handles:
+                ax.legend(handles=handles, title="Model family", loc="best")
+        else:
+            color = REGION_COLORS.get(region, "#1f77b4")
+            ax.errorbar(
+                x_vals,
+                y_vals,
+                xerr=x_err,
+                yerr=y_err,
+                fmt="o",
+                color=color,
+                ecolor=color,
+                elinewidth=1.0,
+                capsize=3,
+                linestyle="none",
+            )
+            for x, y, model_name in zip(x_vals, y_vals, [row["model"] for row in model_rows]):
+                ax.annotate(model_name, (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8)
+    else:
+        ax.scatter([obs_b], [obs_b], color=REGION_COLORS.get(region, "#1f77b4"), label="OBS")
+        ax.annotate("OBS", (obs_b, obs_b), textcoords="offset points", xytext=(5, 5), fontsize=8)
+
+    all_values = np.array([obs_b] + [row["b"] for row in model_rows]) if model_rows else np.array([obs_b])
+    vmin = float(np.nanmin(all_values))
+    vmax = float(np.nanmax(all_values))
+    if not np.isfinite(vmin) or not np.isfinite(vmax):
+        vmin, vmax = -1.0, 1.0
+    if np.isclose(vmin, vmax):
+        pad = max(1.0, abs(vmin) * 0.1 if vmin != 0 else 0.5)
+        vmin -= pad
+        vmax += pad
+    else:
+        pad = 0.1 * (vmax - vmin)
+        vmin -= pad
+        vmax += pad
+
+    ax.plot([vmin, vmax], [vmin, vmax], color="k", linestyle="--", linewidth=1.0)
+    ax.set_xlim(vmin, vmax)
+    ax.set_ylim(vmin, vmax)
+
+    ax.set_xlabel(f"OBS {metric_cfg.title} ({metric_cfg.unit_label})")
+    ax.set_ylabel(f"CMIP {metric_cfg.title} ({metric_cfg.unit_label})")
+    ax.set_title(f"{metric_cfg.title} comparison ({region}, 2003–2014)")
+    ax.grid(True, linestyle=":", alpha=0.5)
+    fig.tight_layout()
+    fig.savefig(fig_path, dpi=300)
+    plt.close(fig)
+    logger.info(f"Saved figure: {fig_path}")
+
+
+def process_region(
+    region: str,
+    metric_cfg: MetricConfig,
+    hac_lags: int,
+    cmip_df: pd.DataFrame,
+    single_region: bool,
+    logger: logging.Logger,
+) -> None:
+    logger.info(f"Processing region {region} for metric {metric_cfg.key}.")
+
+    obs_dir = Path("output/regional_monthly")
+    try:
+        obs_y_path = find_case_insensitive(
+            obs_dir, f"{metric_cfg.obs_y}_mean_2003-2014_{region}.csv"
+        )
+        obs_x_path = find_case_insensitive(
+            obs_dir, f"{metric_cfg.obs_x}_mean_2003-2014_{region}.csv"
+        )
+    except FileNotFoundError as exc:
+        logger.error(str(exc))
+        return
+
+    obs_y_df = read_monthly_csv(obs_y_path, logger)
+    obs_x_df = read_monthly_csv(obs_x_path, logger)
+
+    obs_pair = build_anomaly_pair(obs_y_df, obs_x_df, "OBS", logger)
+    obs_result = run_hac_regression(obs_pair, "OBS", hac_lags, metric_cfg.scale_factor, logger)
+    if obs_result is None:
+        logger.error("Failed to compute OBS regression due to insufficient data.")
+        return
+
+    rows: List[Dict[str, object]] = [
+        {
+            "dataset": "obs",
+            "model": "OBS",
+            "region": region,
+            "metric": metric_cfg.key,
+            **obs_result,
+        }
+    ]
+
+    region_df = cmip_df[cmip_df["region"] == region]
+    if region_df.empty:
+        logger.warning(f"No CMIP entries found for region {region}.")
+        model_rows: List[Dict[str, float]] = []
+        plot_info: Dict[str, Optional[str]] = {}
+    else:
+        model_rows = []
+        plot_info = {}
+        for model in sorted(region_df["model"].unique()):
+            model_data = region_df[region_df["model"] == model]
+            y_df = model_data[["time", "y"]].rename(columns={"y": "value"})
+            x_df = model_data[["time", "x"]].rename(columns={"x": "value"})
+            pair = build_anomaly_pair(y_df, x_df, model, logger)
+            result = run_hac_regression(pair, model, hac_lags, metric_cfg.scale_factor, logger)
+            if result is None:
+                continue
+            rows.append(
+                {
+                    "dataset": "cmip",
+                    "model": model,
+                    "region": region,
+                    "metric": metric_cfg.key,
+                    **result,
+                }
+            )
+            model_rows.append({"model": model, **result})
+            if "family" in model_data.columns:
+                fam = (
+                    model_data["family"].dropna().astype(str).mode().iloc[0]
+                    if not model_data["family"].dropna().empty
+                    else None
+                )
+                plot_info[model] = fam
+            else:
+                plot_info[model] = None
+
+    table_path = Path("tables") / f"feedback_fit_{metric_cfg.key}_{region}.csv"
+    table_path.parent.mkdir(parents=True, exist_ok=True)
+    table_df = pd.DataFrame(rows)[
+        ["dataset", "model", "region", "metric", "b", "SE_HAC", "t", "p", "R2", "n", "sign"]
+    ]
+    # Ensure deterministic order: OBS row first, then models alphabetical
+    table_df["dataset"] = pd.Categorical(
+        table_df["dataset"], categories=["obs", "cmip"], ordered=True
+    )
+    table_df = table_df.sort_values(["dataset", "model"]).reset_index(drop=True)
+    table_df.to_csv(table_path, index=False)
+    logger.info(f"Wrote table: {table_path}")
+
+    fig_path = Path("fig") / f"feedback_fit_{metric_cfg.key}_{region}.png"
+    make_scatter(region, metric_cfg, rows[0], model_rows, plot_info, fig_path, single_region, logger)
+
+
+def main() -> None:
+    args = parse_args()
+    metric_cfg = METRIC_CONFIG[args.metric]
+    regions = load_regions(args.regions)
+    single_region = len(regions) == 1
+
+    cmip_path = Path(args.cmip_csv)
+    cmip_df = load_cmip_table(cmip_path, metric_cfg)
+
+    for region in regions:
+        logger = setup_logger(metric_cfg.key, region, Path("logs"))
+        try:
+            process_region(region, metric_cfg, args.hac_lags, cmip_df, single_region, logger)
+        finally:
+            for handler in list(logger.handlers):
+                handler.close()
+                logger.removeHandler(handler)
 
 
 if __name__ == "__main__":
