@@ -15,7 +15,11 @@ This project investigates the seasonal variability of low-cloud feedbacks (LCF�
 **Structure:**  
 -    Raw and processed datasets  
 -   Analysis results and derived metrics  
--   Generated plots and visualisations  
--    Execution logs  
--   Configuration files for reproducible workflows  
+-   Generated plots and visualisations
+-    Execution logs
+-   Configuration files for reproducible workflows
+
+## Output documentation
+
+An automatically generated catalogue of script outputs lives in [docs/OUTPUT_MAP.md](docs/OUTPUT_MAP.md). Regenerate it with `python scripts/audit_outputs.py`.
 
