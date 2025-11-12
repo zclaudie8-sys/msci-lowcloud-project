@@ -1,928 +1,643 @@
-"""Cloud-controlling factor (CCF) regression and feedback analysis."""
+#!/usr/bin/env python3
+"""Cloud-controlling factor (CCF) regression and sensitivity analysis.
+
+This script implements the core regression engine used throughout the
+low-cloud analysis pipeline. It loads gridded panels of monthly data,
+constructs non-local neighbourhood predictors, performs ridge regression
+with leave-one-year-out cross validation, and computes both coefficient
+sensitivities and permutation-based importance metrics.
+"""
 
 from __future__ import annotations
 
 import argparse
 import logging
-import sys
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm
-from matplotlib import pyplot as plt
-from sklearn.decomposition import PCA
+import xarray as xr
+import yaml
+from sklearn.linear_model import Ridge
+from sklearn.metrics import r2_score
+from sklearn.model_selection import GroupKFold
 
 
-DEFAULT_FACTORS = ("EIS", "Ts")
+FACTOR_NAMES: Tuple[str, ...] = (
+    "SST",
+    "EIS",
+    "RH700",
+    "OMEGA700",
+    "WS10",
+    "SSTADV",
+)
 
-FACTOR_ALIASES: Dict[str, Tuple[str, ...]] = {
-    "SWCRE": ("swcre", "sw_cld", "swcre_mean"),
-    "EIS": ("eis", "eislts", "lower_tropospheric_stability"),
-    "Ts": ("ts", "tas", "surface_temperature"),
-    "LCF": ("lcf", "low_cld_frac", "low_cloud_fraction"),
-    "omega500": ("omega500", "omega_500", "wap500"),
-    "RH700": ("rh700", "q700", "rh_700", "q_700"),
-    "sstgrad": ("sstgrad", "sst_grad"),
-    "u10": ("u10", "uas", "u_10"),
-    "v10": ("v10", "vas", "v_10"),
+DEFAULT_REGION_BOXES: Mapping[str, Sequence[float]] = {
+    # [lon_min, lon_max, lat_min, lat_max]
+    "SEP": (-110.0, -70.0, -35.0, -15.0),
+    "SEA": (-30.0, 0.0, -30.0, 0.0),
+    "NEP": (-155.0, -115.0, 15.0, 30.0),
+    "NEA": (-30.0, 15.0, 15.0, 30.0),
+    "SEI": (90.0, 150.0, -30.0, 0.0),
 }
 
-
-@dataclass
-class RegressionConfig:
-    method: str
-    factors: Sequence[str]
-    hac_lags: int = 12
-    pcr_var: float = 0.9
-    standardize: str = "zscore"
-    mbb: int = 1000
-    mbb_block: int = 3
-    importance_block: int = 3
+SEASONALITY_CHOICES = ("SEASON", "DESEASON", "BOTH")
 
 
-@dataclass
-class DatasetResult:
-    dataset: str
-    model: str
-    region: str
-    season: str
-    method: str
-    factors: Sequence[str]
-    beta: Dict[str, float]
-    se: Dict[str, float]
-    tvalue: Dict[str, float]
-    pvalue: Dict[str, float]
-    r2: float
-    n: int
-    standardized: bool
+# ---------------------------------------------------------------------------
+# Argument parsing helpers
+# ---------------------------------------------------------------------------
 
-
-def parse_list_argument(value: str) -> List[str]:
-    if value is None:
+def parse_float_list(raw: str) -> List[float]:
+    if not raw:
         return []
-    parts = [v.strip() for v in value.split(",")]
-    return [p for p in parts if p]
+    values: List[float] = []
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        values.append(float(value))
+    return values
 
 
-def normalise_factor_name(name: str) -> str:
-    name_upper = name.upper()
-    if name_upper in FACTOR_ALIASES:
-        return name_upper
-    lowered = name.lower()
-    for canonical, aliases in FACTOR_ALIASES.items():
-        if lowered == canonical.lower() or any(alias in lowered for alias in aliases):
-            return canonical
-    return name_upper
+def parse_str_list(raw: str) -> List[str]:
+    if not raw:
+        return []
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
-def ensure_output_dir(path: Path) -> None:
+def parse_lon_lat_range(raw: Optional[str]) -> Optional[Tuple[float, float, float, float]]:
+    if not raw:
+        return None
+    parts = [float(p) for p in raw.split(",")]
+    if len(parts) != 4:
+        raise ValueError("--lon-lat-range expects four comma-separated numbers")
+    lon_min, lon_max, lat_min, lat_max = parts
+    return lon_min, lon_max, lat_min, lat_max
+
+
+def parse_window(raw: Optional[str]) -> Optional[Tuple[pd.Timestamp, pd.Timestamp]]:
+    if not raw:
+        return None
+    try:
+        start_str, end_str = raw.split(":", 1)
+    except ValueError as exc:
+        raise ValueError("--window expects START:END (YYYY-MM:YYYY-MM)") from exc
+    start = pd.to_datetime(start_str.strip())
+    end = pd.to_datetime(end_str.strip())
+    return start, end
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Cloud-controlling-factor ridge analysis")
+    parser.add_argument("--yvar", required=True, help="Target variable: SWCRE, LWCRE, or LCF")
+    parser.add_argument("--seasonality", default="SEASON", choices=SEASONALITY_CHOICES)
+    parser.add_argument("--regions", default="SEP,SEA,NEP,NEA,SEI", help="Comma-separated region keys")
+    parser.add_argument("--neigh", type=int, default=5, help="Neighbourhood width (must be odd)")
+    parser.add_argument("--alphas", default="1e-3,3e-3,1e-2,3e-2,1e-1,3e-1,1,3,10,30,100,300,1000")
+    parser.add_argument("--block", type=int, default=3, help="Block length (months) for permutation shuffles")
+    parser.add_argument("--shuffles", type=int, default=20, help="Number of permutation replicates per factor")
+    parser.add_argument("--lon-lat-range", dest="lon_lat_range", help="lon_min,lon_max,lat_min,lat_max")
+    parser.add_argument("--window", help="Time window START:END (YYYY-MM:YYYY-MM)")
+    parser.add_argument("--data-root", default="data/panel", help="Root directory for panel data")
+    parser.add_argument("--cmip-csv", help="Optional CMIP stacked panel CSV (for logging only)")
+    parser.add_argument("--out", default="results/ccf", help="Output directory for NetCDF results")
+    parser.add_argument("--fig", dest="fig_dir", help="Optional figure output directory")
+    parser.add_argument("--cartopy", action="store_true", help="Enable cartopy figure production (not implemented)")
+    parser.add_argument("--dry-run", action="store_true", help="Run analysis without writing outputs")
+    parser.add_argument("--seed", type=int, default=1234, help="Random seed for permutation importance")
+    return parser
+
+
+# ---------------------------------------------------------------------------
+# IO utilities
+# ---------------------------------------------------------------------------
+
+def ensure_parent(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
 
 
-def setup_logger(log_path: Path) -> logging.Logger:
-    ensure_output_dir(log_path)
-    logger = logging.getLogger(str(log_path))
-    logger.setLevel(logging.INFO)
-    if logger.handlers:
-        return logger
-    handler = logging.FileHandler(log_path)
-    fmt = logging.Formatter(
-        "%(asctime)s - %(levelname)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-    handler.setFormatter(fmt)
-    logger.addHandler(handler)
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(fmt)
-    logger.addHandler(stream)
-    return logger
-
-
-def find_obs_file(base_dir: Path, region: str, factor: str) -> Optional[Path]:
-    if not base_dir.exists():
-        return None
-    region_lower = region.lower()
-    factor_aliases = FACTOR_ALIASES.get(factor, (factor.lower(),))
-    for candidate in base_dir.glob(f"*{region}*.csv"):
-        lower = candidate.name.lower()
-        if region_lower not in lower:
+def load_regions(region_keys: Sequence[str]) -> Dict[str, Sequence[float]]:
+    config_path = Path("configs/config.yaml")
+    boxes: Dict[str, Sequence[float]] = {}
+    if config_path.exists():
+        with config_path.open("r", encoding="utf8") as fh:
+            cfg = yaml.safe_load(fh)
+        if isinstance(cfg, dict) and "regions" in cfg and isinstance(cfg["regions"], dict):
+            for key, value in cfg["regions"].items():
+                if isinstance(value, (list, tuple)) and len(value) == 4:
+                    boxes[key.upper()] = tuple(float(v) for v in value)
+    for key in region_keys:
+        key_upper = key.upper()
+        if key_upper in boxes:
             continue
-        if any(alias in lower for alias in factor_aliases):
-            return candidate
-    return None
-
-
-def read_obs_series(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    if df.empty:
-        raise ValueError(f"OBS file {path} is empty")
-    cols = {col.lower(): col for col in df.columns}
-    time_col = None
-    for key in ("time", "month", "date"):
-        if key in cols:
-            time_col = cols[key]
-            break
-    if time_col is None:
-        raise ValueError(f"Unable to infer time column for {path}")
-    value_cols = [c for c in df.columns if c != time_col]
-    if not value_cols:
-        raise ValueError(f"No value column found in {path}")
-    value_col = value_cols[0]
-    series = df[[time_col, value_col]].copy()
-    series[value_col] = pd.to_numeric(series[value_col], errors="coerce")
-    try:
-        series["time"] = pd.to_datetime(series[time_col])
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Unable to parse time column in {path}: {exc}") from exc
-    series = series.rename(columns={value_col: "value"})[["time", "value"]]
-    return series.sort_values("time").dropna(subset=["value"])
-
-
-def load_obs_dataset(
-    region: str,
-    required: Sequence[str],
-    optional: Sequence[str],
-    base_dir: Path,
-    logger: logging.Logger,
-) -> Tuple[pd.DataFrame, Dict[str, Path]]:
-    needed = list(dict.fromkeys(list(required) + list(optional)))
-    data: Optional[pd.DataFrame] = None
-    found: Dict[str, Path] = {}
-    for factor in needed:
-        file_path = find_obs_file(base_dir, region, factor)
-        if file_path is None:
-            continue
-        series = read_obs_series(file_path)
-        series = series.rename(columns={"value": factor})
-        if data is None:
-            data = series
+        if key_upper in DEFAULT_REGION_BOXES:
+            boxes[key_upper] = DEFAULT_REGION_BOXES[key_upper]
         else:
-            data = pd.merge(data, series, on="time", how="outer")
-        found[factor] = file_path
-    if data is None:
-        raise FileNotFoundError(f"No observational data for region {region}")
-    data = data.sort_values("time").reset_index(drop=True)
-    missing = [f for f in required if f not in data.columns]
-    if missing:
-        raise FileNotFoundError(
-            f"Missing required observational factors {missing} for region {region}"
-        )
-    for factor in optional:
-        if factor not in data.columns:
-            logger.warning(
-                "Optional observational factor %s missing for region %s", factor, region
-            )
-    return data, found
+            raise KeyError(f"Region '{key}' not found in configuration or defaults")
+    return boxes
 
 
-def standardise_predictors(
-    X: np.ndarray, mode: str
-) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray]]:
-    if mode.lower() != "zscore":
-        return X.copy(), None, None
-    mean = np.nanmean(X, axis=0)
-    std = np.nanstd(X, axis=0, ddof=1)
+def standardise_longitude(da: xr.DataArray) -> xr.DataArray:
+    """Return a copy of *da* with longitude in [-180, 180)."""
+    lon_name = "lon" if "lon" in da.coords else "longitude"
+    lon = da[lon_name]
+    lon_std = ((lon + 180.0) % 360.0) - 180.0
+    return da.assign_coords({lon_name: lon_std}).sortby(lon_name)
+
+
+def subset_lon_lat(
+    da: xr.DataArray,
+    lon_lat_range: Optional[Tuple[float, float, float, float]],
+) -> xr.DataArray:
+    if lon_lat_range is None:
+        return da
+    lon_min, lon_max, lat_min, lat_max = lon_lat_range
+    lat_name = "lat" if "lat" in da.coords else "latitude"
+    lon_name = "lon" if "lon" in da.coords else "longitude"
+    da = da.sortby(lat_name)
+    da = da.sel({lat_name: slice(lat_min, lat_max)})
+    if lon_min <= lon_max:
+        da = da.sel({lon_name: slice(lon_min, lon_max)})
+    else:
+        left = da.sel({lon_name: slice(lon_min, 180)})
+        right = da.sel({lon_name: slice(-180, lon_max)})
+        da = xr.concat([left, right], dim=lon_name)
+    return da
+
+
+def subset_time(da: xr.DataArray, window: Optional[Tuple[pd.Timestamp, pd.Timestamp]]) -> xr.DataArray:
+    if window is None:
+        return da
+    start, end = window
+    return da.sel(time=slice(start, end))
+
+
+def deseasonalise(da: xr.DataArray) -> xr.DataArray:
+    clim = da.groupby("time.month").mean("time")
+    return da.groupby("time.month") - clim
+
+
+def load_panel_variable(
+    data_root: Path,
+    seasonality: str,
+    var: str,
+    fallback: Optional[xr.DataArray] = None,
+) -> xr.DataArray:
+    seasonality_lower = seasonality.lower()
+    path = data_root / seasonality_lower / f"{var}.nc"
+    if path.exists():
+        da = xr.open_dataarray(path)
+    else:
+        if fallback is None:
+            raise FileNotFoundError(f"Panel file not found: {path}")
+        da = deseasonalise(fallback)
+    return da
+
+
+def load_panel_group(
+    data_root: Path,
+    seasonality: str,
+    variables: Sequence[str],
+    base_cache: Optional[Dict[str, xr.DataArray]] = None,
+) -> Dict[str, xr.DataArray]:
+    cache: Dict[str, xr.DataArray] = {}
+    fallback_group = base_cache if seasonality.lower() == "deseason" else None
+    for var in variables:
+        fallback = None
+        if fallback_group is not None and var in fallback_group:
+            fallback = fallback_group[var]
+        cache[var] = load_panel_variable(data_root, seasonality, var, fallback=fallback)
+    return cache
+
+
+# ---------------------------------------------------------------------------
+# Feature construction
+# ---------------------------------------------------------------------------
+
+def build_neighbourhood(da: xr.DataArray, size: int) -> np.ndarray:
+    if size % 2 == 0:
+        raise ValueError("Neighbourhood size must be odd")
+    half = size // 2
+    data = da.values
+    padded = np.pad(data, ((0, 0), (half, half), (0, 0)), mode="edge")
+    padded = np.pad(padded, ((0, 0), (0, 0), (half, half)), mode="wrap")
+    neighbourhoods = []
+    for dy in range(size):
+        for dx in range(size):
+            window = padded[:, dy : dy + data.shape[1], dx : dx + data.shape[2]]
+            neighbourhoods.append(window)
+    stacked = np.stack(neighbourhoods, axis=-1)
+    return stacked  # shape: (time, lat, lon, size*size)
+
+
+# ---------------------------------------------------------------------------
+# Cross-validation helpers
+# ---------------------------------------------------------------------------
+
+def _prepare_cv_splits(groups: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+    unique_groups = np.unique(groups)
+    if unique_groups.size < 2:
+        raise ValueError("Need at least two unique years for cross-validation")
+    splitter = GroupKFold(n_splits=unique_groups.size)
+    indices = np.arange(groups.size)
+    return [(train, test) for train, test in splitter.split(indices, groups=groups)]
+
+
+def _standardise(train: np.ndarray, test: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    mean = train.mean(axis=0)
+    std = train.std(axis=0)
     std[std == 0] = 1.0
-    return (X - mean) / std, mean, std
+    train_s = (train - mean) / std
+    test_s = (test - mean) / std
+    return train_s, test_s, mean, std
 
 
-def compute_monthly_anomalies(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
-    df = df.copy()
-    if "time" not in df.columns:
-        raise ValueError("Input dataframe requires a 'time' column")
-    df["month"] = df["time"].dt.month
-    for col in columns:
-        clim = df.groupby("month")[col].transform("mean")
-        df[col] = df[col] - clim
-    return df.drop(columns=["month"])
-
-
-def season_mask(times: pd.Series, season: str) -> np.ndarray:
-    if season.upper() == "ALL":
-        return np.ones(len(times), dtype=bool)
-    months = times.dt.month
-    if season.upper() == "JJA":
-        return months.isin([6, 7, 8]).to_numpy()
-    if season.upper() == "DJF":
-        return months.isin([12, 1, 2]).to_numpy()
-    raise ValueError(f"Unsupported season {season}")
-
-
-def require_minimum_samples(n: int, season: str) -> bool:
-    if season.upper() == "ALL":
-        return n >= 24
-    return n >= 18
-
-
-def hac_ols(y: np.ndarray, X: np.ndarray, hac_lags: int):
-    model = sm.OLS(y, sm.add_constant(X))
-    return model.fit(cov_type="HAC", cov_kwds={"maxlags": hac_lags})
-
-
-def fit_mlr(
-    y: np.ndarray,
+def select_alpha(
     X: np.ndarray,
-    factor_names: Sequence[str],
-    config: RegressionConfig,
-) -> Tuple[DatasetResult, Dict[str, float]]:
-    X_proc, mean, std = standardise_predictors(X, config.standardize)
-    res = hac_ols(y, X_proc, config.hac_lags)
-    params = res.params[1:]
-    ses = res.bse[1:]
-    tvals = res.tvalues[1:]
-    pvals = res.pvalues[1:]
-    beta = {f: float(params[i]) for i, f in enumerate(factor_names)}
-    se = {f: float(ses[i]) for i, f in enumerate(factor_names)}
-    tvalue = {f: float(tvals[i]) for i, f in enumerate(factor_names)}
-    pvalue = {f: float(pvals[i]) for i, f in enumerate(factor_names)}
-    info = {
-        "mean": mean,
-        "std": std,
-        "pred": res.predict(),
-        "intercept": float(res.params[0]),
-        "r2": float(res.rsquared),
-    }
-    dataset_result = DatasetResult(
-        dataset="",
-        model="",
-        region="",
-        season="",
-        method="MLR",
-        factors=factor_names,
-        beta=beta,
-        se=se,
-        tvalue=tvalue,
-        pvalue=pvalue,
-        r2=float(res.rsquared),
-        n=int(res.nobs),
-        standardized=config.standardize.lower() == "zscore",
-    )
-    return dataset_result, info
-
-
-def _fit_pcr_once(
     y: np.ndarray,
+    groups: np.ndarray,
+    alphas: Sequence[float],
+    splits: List[Tuple[np.ndarray, np.ndarray]],
+) -> Tuple[float, float, np.ndarray]:
+    best_alpha = None
+    best_r2 = -np.inf
+    best_preds = None
+    for alpha in alphas:
+        preds = np.empty_like(y, dtype=float)
+        for train_idx, test_idx in splits:
+            X_train = X[train_idx]
+            X_test = X[test_idx]
+            y_train = y[train_idx]
+            train_s, test_s, _, _ = _standardise(X_train, X_test)
+            model = Ridge(alpha=alpha)
+            model.fit(train_s, y_train)
+            preds[test_idx] = model.predict(test_s)
+        score = r2_score(y, preds)
+        if score > best_r2:
+            best_r2 = score
+            best_alpha = alpha
+            best_preds = preds.copy()
+    if best_alpha is None or best_preds is None:
+        raise RuntimeError("Unable to determine best alpha")
+    return float(best_alpha), float(best_r2), best_preds
+
+
+def cross_validated_r2(
     X: np.ndarray,
-    factor_names: Sequence[str],
-    config: RegressionConfig,
-) -> Dict[str, object]:
-    X_proc, mean, std = standardise_predictors(X, config.standardize)
-    X_center = X_proc - np.nanmean(X_proc, axis=0, keepdims=True)
-    pca = PCA()
-    scores = pca.fit_transform(X_center)
-    if scores.size == 0:
-        raise ValueError("Unable to perform PCA on the provided predictors")
-    cumvar = np.cumsum(pca.explained_variance_ratio_)
-    threshold = float(config.pcr_var)
-    k = int(np.searchsorted(cumvar, threshold) + 1)
-    k = max(1, min(k, scores.shape[1]))
-    scores_k = scores[:, :k]
-    res = sm.OLS(y, sm.add_constant(scores_k)).fit()
-    beta_pc = res.params[1:]
-    intercept_pc = float(res.params[0])
-    components = pca.components_[:k, :]
-    beta = components.T @ beta_pc
-    intercept = intercept_pc - np.nanmean(X_proc, axis=0) @ beta
-    y_hat = intercept + X_proc @ beta
-    y_mean = y.mean()
-    ss_res = float(np.sum((y - y_hat) ** 2))
-    ss_tot = float(np.sum((y - y_mean) ** 2))
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
-    return {
-        "beta": beta,
-        "intercept": intercept,
-        "mean": mean,
-        "std": std,
-        "r2": r2,
-        "k": k,
-        "cumvar": float(cumvar[k - 1]),
-    }
-
-
-def moving_block_indices(n: int, block_size: int, rng: np.random.Generator) -> np.ndarray:
-    if block_size <= 1:
-        return rng.integers(0, n, size=n)
-    blocks: List[int] = []
-    starts = np.arange(0, max(n - block_size + 1, 1))
-    while len(blocks) < n:
-        start = int(rng.choice(starts))
-        block = list(range(start, min(start + block_size, n)))
-        blocks.extend(block)
-    return np.array(blocks[:n], dtype=int)
-
-
-def fit_pcr(
     y: np.ndarray,
+    splits: Sequence[Tuple[np.ndarray, np.ndarray]],
+    alpha: float,
+) -> float:
+    preds = np.empty_like(y, dtype=float)
+    for train_idx, test_idx in splits:
+        X_train = X[train_idx]
+        X_test = X[test_idx]
+        y_train = y[train_idx]
+        train_s, test_s, _, _ = _standardise(X_train, X_test)
+        model = Ridge(alpha=alpha)
+        model.fit(train_s, y_train)
+        preds[test_idx] = model.predict(test_s)
+    return float(r2_score(y, preds))
+
+
+def fit_final_model(
     X: np.ndarray,
-    factor_names: Sequence[str],
-    config: RegressionConfig,
-    rng: np.random.Generator,
-) -> Tuple[DatasetResult, Dict[str, float]]:
-    base = _fit_pcr_once(y, X, factor_names, config)
-    beta = {f: float(base["beta"][i]) for i, f in enumerate(factor_names)}
-    info = {
-        "k": base["k"],
-        "cumvar": base["cumvar"],
-        "r2": base["r2"],
-    }
-    boot: List[np.ndarray] = []
-    for _ in range(config.mbb):
-        idx = moving_block_indices(len(y), config.mbb_block, rng)
-        try:
-            res = _fit_pcr_once(y[idx], X[idx], factor_names, config)
-        except Exception:  # noqa: BLE001
-            continue
-        boot.append(res["beta"])
-    if boot:
-        boot_arr = np.vstack(boot)
-        lower = np.percentile(boot_arr, 2.5, axis=0)
-        upper = np.percentile(boot_arr, 97.5, axis=0)
-        se = 0.5 * (upper - lower) / 1.96
-        med = np.median(boot_arr, axis=0)
-        beta = {f: float(med[i]) for i, f in enumerate(factor_names)}
-        se_dict = {f: float(se[i]) for i, f in enumerate(factor_names)}
-    else:
-        se_dict = {f: np.nan for f in factor_names}
-    dataset_result = DatasetResult(
-        dataset="",
-        model="",
-        region="",
-        season="",
-        method="PCR",
-        factors=factor_names,
-        beta=beta,
-        se=se_dict,
-        tvalue={f: np.nan for f in factor_names},
-        pvalue={f: np.nan for f in factor_names},
-        r2=float(base["r2"]),
-        n=len(y),
-        standardized=config.standardize.lower() == "zscore",
-    )
-    return dataset_result, info
+    y: np.ndarray,
+    alpha: float,
+) -> Tuple[np.ndarray, float, np.ndarray, np.ndarray]:
+    mean = X.mean(axis=0)
+    std = X.std(axis=0)
+    std[std == 0] = 1.0
+    X_s = (X - mean) / std
+    model = Ridge(alpha=alpha)
+    model.fit(X_s, y)
+    coef = model.coef_ / std
+    intercept = float(model.intercept_ - np.dot(coef, mean))
+    return coef.astype(float), intercept, mean, std
 
 
-def block_permutation(arr: np.ndarray, block_size: int, rng: np.random.Generator) -> np.ndarray:
-    n = len(arr)
-    if block_size <= 1 or block_size >= n:
-        return arr[rng.permutation(n)]
-    blocks = [np.arange(i, min(i + block_size, n)) for i in range(0, n, block_size)]
+# ---------------------------------------------------------------------------
+# Permutation utilities
+# ---------------------------------------------------------------------------
+
+def block_permutation_indices(n: int, block: int, rng: np.random.Generator) -> np.ndarray:
+    if block <= 1 or n <= block:
+        return rng.permutation(n)
+    blocks = [np.arange(i, min(i + block, n)) for i in range(0, n, block)]
     rng.shuffle(blocks)
-    idx = np.concatenate(blocks)
-    return arr[idx]
+    return np.concatenate(blocks)
 
 
-def permutation_importance(
-    y: np.ndarray,
-    X: np.ndarray,
-    factor_names: Sequence[str],
-    config: RegressionConfig,
-    base_r2: float,
-    fit_func,
-    rng: np.random.Generator,
-) -> Dict[str, float]:
-    delta: Dict[str, float] = {}
-    for col, name in enumerate(factor_names):
-        X_perm = X.copy()
-        X_perm[:, col] = block_permutation(X_perm[:, col], config.importance_block, rng)
-        try:
-            result = fit_func(y, X_perm, factor_names)
-            shuffled_r2 = float(result["r2"])
-        except Exception:  # noqa: BLE001
-            shuffled_r2 = np.nan
-        delta[name] = base_r2 - shuffled_r2 if np.isfinite(shuffled_r2) else np.nan
-    return delta
+# ---------------------------------------------------------------------------
+# Region utilities
+# ---------------------------------------------------------------------------
+
+def region_subset(da: xr.DataArray, box: Sequence[float]) -> xr.DataArray:
+    lon_min, lon_max, lat_min, lat_max = box
+    lat_name = "lat" if "lat" in da.coords else "latitude"
+    lon_name = "lon" if "lon" in da.coords else "longitude"
+    da = da.sortby(lat_name)
+    da = standardise_longitude(da)
+    da = da.sel({lat_name: slice(lat_min, lat_max)})
+    if lon_min <= lon_max:
+        return da.sel({lon_name: slice(lon_min, lon_max)})
+    left = da.sel({lon_name: slice(lon_min, 180)})
+    right = da.sel({lon_name: slice(-180, lon_max)})
+    return xr.concat([left, right], dim=lon_name).sortby(lon_name)
 
 
-def fit_func_mlr(y, X, factor_names, config):
-    res, _ = fit_mlr(y, X, factor_names, config)
-    return {"r2": res.r2}
+def area_weighted_mean(da: xr.DataArray) -> xr.DataArray:
+    lat_name = "lat" if "lat" in da.coords else "latitude"
+    lon_name = "lon" if "lon" in da.coords else "longitude"
+    lat_vals = da[lat_name].values
+    lon_vals = da[lon_name].values
+    weights = xr.DataArray(
+        np.cos(np.deg2rad(lat_vals))[:, None] * np.ones((lat_vals.size, lon_vals.size)),
+        coords={lat_name: lat_vals, lon_name: lon_vals},
+        dims=(lat_name, lon_name),
+    )
+    return da.weighted(weights).mean(dim=(lat_name, lon_name))
 
 
-def fit_func_pcr(y, X, factor_names, config, rng):
-    base = _fit_pcr_once(y, X, factor_names, config)
-    return {"r2": base["r2"]}
+# ---------------------------------------------------------------------------
+# Main analysis routine
+# ---------------------------------------------------------------------------
 
-
-def fit_feedback_chain(
-    df: pd.DataFrame,
+def process_seasonality(
+    args: argparse.Namespace,
+    seasonality: str,
+    regions: Mapping[str, Sequence[float]],
     logger: logging.Logger,
-    season: str,
-    hac_lags: int,
-) -> Optional[Dict[str, float]]:
-    needed = ["SWCRE", "LCF", "EIS", "Ts"]
-    if any(col not in df.columns for col in needed):
-        logger.warning("Feedback decomposition skipped – missing required columns: %s", needed)
-        return None
-    dfs = compute_monthly_anomalies(df[["time"] + needed], needed)
-    mask = season_mask(dfs["time"], season)
-    subset = dfs.loc[mask].dropna()
-    if not require_minimum_samples(len(subset), season):
-        logger.warning("Insufficient samples for feedback decomposition: %s", len(subset))
-        return None
-    swcre = subset["SWCRE"].to_numpy()
-    lcf = subset["LCF"].to_numpy()
-    eis = subset["EIS"].to_numpy()
-    ts = subset["Ts"].to_numpy()
-    try:
-        res_sw_lcf = hac_ols(swcre, lcf[:, None], hac_lags)
-        res_lcf_eis = hac_ols(lcf, eis[:, None], hac_lags)
-        res_eis_ts = hac_ols(eis, ts[:, None], hac_lags)
-        res_sw_ts = hac_ols(swcre, ts[:, None], hac_lags)
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Feedback decomposition failed: %s", exc)
-        return None
-    beta_sw_lcf = float(res_sw_lcf.params[1])
-    beta_lcf_eis = float(res_lcf_eis.params[1])
-    beta_eis_ts = float(res_eis_ts.params[1])
-    lambda_chain = beta_sw_lcf * beta_lcf_eis * beta_eis_ts
+) -> None:
+    data_root = Path(args.data_root)
+    yvar = args.yvar.upper()
+    variables = list(FACTOR_NAMES) + [yvar]
+
+    base_season_cache: Optional[Dict[str, xr.DataArray]] = None
+    if seasonality.lower() == "deseason":
+        base_season_cache = load_panel_group(data_root, "season", variables)
+
+    panels = load_panel_group(data_root, seasonality, variables, base_cache=base_season_cache)
+
+    lon_lat_range = parse_lon_lat_range(args.lon_lat_range)
+    time_window = parse_window(args.window)
+
+    for key, da in panels.items():
+        da = standardise_longitude(da)
+        da = subset_lon_lat(da, lon_lat_range)
+        da = subset_time(da, time_window)
+        panels[key] = da
+
+    time_coord = panels[yvar].coords["time"]
+    years = pd.to_datetime(time_coord.values).year.astype(int)
+
+    lat_name = "lat" if "lat" in panels[yvar].coords else "latitude"
+    lon_name = "lon" if "lon" in panels[yvar].coords else "longitude"
+    lat = panels[yvar][lat_name].values
+    lon = panels[yvar][lon_name].values
+
+    sst = panels["SST"]
+    ocean_mask = np.isfinite(sst.mean("time").values)
+    lat_mask = (np.abs(lat) <= 60.0)[:, None]
+    mask = ocean_mask & lat_mask
+
+    size = args.neigh
+    factor_neigh: Dict[str, np.ndarray] = {}
+    for factor in FACTOR_NAMES:
+        factor_neigh[factor] = build_neighbourhood(panels[factor], size)
+
+    all_features = np.concatenate([factor_neigh[f] for f in FACTOR_NAMES], axis=-1)
+    target = panels[yvar].values
+
+    n_time, n_lat, n_lon, n_features = all_features.shape
     logger.info(
-        "Feedback decomposition slopes: dSWCRE/dLCF=%.3f, dLCF/dEIS=%.3f, dEIS/dTs=%.3f -> lambda_prod=%.3f",
-        beta_sw_lcf,
-        beta_lcf_eis,
-        beta_eis_ts,
-        lambda_chain,
-    )
-    direct = float(res_sw_ts.params[1])
-    logger.info("Direct lambda_SW (SWCRE vs Ts) = %.3f", direct)
-    return {
-        "dSWCRE_dLCF": beta_sw_lcf,
-        "dLCF_dEIS": beta_lcf_eis,
-        "dEIS_dTs": beta_eis_ts,
-        "lambda_prod": lambda_chain,
-        "lambda_direct": direct,
-    }
-
-
-def build_cmip_table(cmip_csv: Path) -> pd.DataFrame:
-    if not cmip_csv.exists():
-        raise FileNotFoundError(f"CMIP CSV not found: {cmip_csv}")
-    df = pd.read_csv(cmip_csv)
-    if df.empty:
-        raise ValueError(f"CMIP CSV {cmip_csv} is empty")
-    lower_map = {col.lower(): col for col in df.columns}
-    required = ["model", "region", "time", "swcre", "eis", "ts"]
-    missing = [key for key in required if key not in lower_map]
-    if missing:
-        raise KeyError(f"Missing required CMIP columns: {missing}")
-    rename: Dict[str, str] = {}
-    for canonical, aliases in FACTOR_ALIASES.items():
-        for alias in aliases:
-            if alias in lower_map:
-                rename[lower_map[alias]] = canonical
-                break
-    rename[lower_map["model"]] = "model"
-    rename[lower_map["region"]] = "region"
-    rename[lower_map["time"]] = "time"
-    df = df.rename(columns=rename)
-    df["time"] = pd.to_datetime(df["time"])
-    return df
-
-
-def plot_betas(df: pd.DataFrame, output_path: Path, region: str, method: str, season: str) -> None:
-    ensure_output_dir(output_path)
-    if df.empty:
-        return
-    factors = list(dict.fromkeys(df["factor"]))
-    obs = df[df["dataset"] == "obs"]
-    cmip = df[df["dataset"] == "cmip"]
-    fig, ax = plt.subplots(figsize=(max(6, len(factors) * 1.2), 4))
-    offsets = np.linspace(-0.2, 0.2, max(len(cmip["model"].unique()), 2)) if not cmip.empty else np.array([0.0])
-    for i, factor in enumerate(factors):
-        x_base = i
-        obs_row = obs[obs["factor"] == factor]
-        if not obs_row.empty:
-            row = obs_row.iloc[0]
-            ax.errorbar(
-                x_base - 0.25,
-                row["beta"],
-                yerr=row["se"],
-                fmt="o",
-                color="black",
-                label="OBS" if i == 0 else "",
-            )
-        models_for_factor = cmip[cmip["factor"] == factor]
-        for j, (_, row) in enumerate(models_for_factor.iterrows()):
-            off = offsets[j % len(offsets)]
-            ax.errorbar(
-                x_base + off,
-                row["beta"],
-                yerr=row["se"],
-                fmt="s",
-                color="tab:blue",
-                alpha=0.7,
-                label=row["model"] if i == 0 else "",
-            )
-    ax.axhline(0, color="grey", linewidth=0.8)
-    ax.set_xticks(range(len(factors)))
-    ax.set_xticklabels(factors)
-    ax.set_ylabel("Beta (W m$^{-2}$ per unit factor)")
-    ax.set_title(f"CCF betas – {region} – {method} – {season}")
-    handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    if by_label:
-        ax.legend(by_label.values(), by_label.keys(), fontsize="small", frameon=False)
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=300)
-    plt.close(fig)
-
-
-def plot_contributions(df: pd.DataFrame, output_path: Path, region: str, method: str, season: str) -> None:
-    ensure_output_dir(output_path)
-    if df.empty:
-        return
-    df_plot = df.sort_values("delta_R2", ascending=False)
-    fig, ax = plt.subplots(figsize=(6, max(3, len(df_plot) * 0.3)))
-    y_pos = np.arange(len(df_plot))
-    colors = ["black" if row.dataset == "obs" else "tab:blue" for row in df_plot.itertuples()]
-    ax.barh(y_pos, df_plot["delta_R2"], color=colors)
-    ax.set_yticks(y_pos)
-    labels = [f"{row.model} – {row.factor}" for row in df_plot.itertuples()]
-    ax.set_yticklabels(labels)
-    ax.invert_yaxis()
-    ax.set_xlabel("ΔR²")
-    ax.set_title(f"Permutation importance – {region} – {method} – {season}")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=300)
-    plt.close(fig)
-
-
-def plot_feedback(df: pd.DataFrame, output_path: Path, region: str, season: str) -> None:
-    ensure_output_dir(output_path)
-    if df.empty:
-        return
-    fig, ax = plt.subplots(figsize=(5, 5))
-    if "lambda_direct" in df.columns and df["lambda_direct"].notna().any():
-        colors = ["black" if d == "obs" else "tab:blue" for d in df["dataset"]]
-        ax.scatter(df["lambda_direct"], df["lambda_prod"], c=colors)
-        values = df[["lambda_direct", "lambda_prod"]].to_numpy()
-        finite = np.isfinite(values)
-        if finite.any():
-            min_val = float(np.nanmin(values))
-            max_val = float(np.nanmax(values))
-            ax.plot([min_val, max_val], [min_val, max_val], "--", color="grey")
-        ax.set_xlabel("Direct $\\lambda_{SW}$ (W m$^{-2}$ K$^{-1}$)")
-        ax.set_ylabel("Decomposed $\\lambda_{prod}$ (W m$^{-2}$ K$^{-1}$)")
-    else:
-        y_pos = np.arange(len(df))
-        colors = ["black" if d == "obs" else "tab:blue" for d in df["dataset"]]
-        ax.barh(y_pos, df["lambda_prod"], color=colors)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels([f"{row.model}" for row in df.itertuples()])
-        ax.set_xlabel("$\\lambda_{prod}$ (W m$^{-2}$ K$^{-1}$)")
-        ax.set_ylabel("Model")
-    ax.set_title(f"Feedback decomposition – {region} – {season}")
-    fig.tight_layout()
-    fig.savefig(output_path, dpi=300)
-    plt.close(fig)
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Cloud controlling factor analysis")
-    parser.add_argument("--regions", required=True, help="Comma-separated region list")
-    parser.add_argument("--method", choices=["MLR", "PCR"], default="MLR")
-    parser.add_argument("--factors", default=",".join(DEFAULT_FACTORS))
-    parser.add_argument("--cmip-csv", default="output/cmip_amip_monthly_2003-2014.csv")
-    parser.add_argument("--hac-lags", type=int, default=12)
-    parser.add_argument("--pcr-var", type=float, default=0.9)
-    parser.add_argument("--standardize", choices=["none", "zscore"], default="zscore")
-    parser.add_argument("--season", choices=["ALL", "JJA", "DJF"], default="ALL")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--mbb", type=int, default=1000, help="Bootstrap samples for PCR")
-    parser.add_argument("--mbb-block", type=int, default=3, help="Bootstrap block size")
-    parser.add_argument(
-        "--importance-block", type=int, default=3, help="Block size for permutation importance"
+        "Seasonality %s: loaded data with %d months, %d lat × %d lon, %d features",
+        seasonality,
+        n_time,
+        n_lat,
+        n_lon,
+        n_features,
     )
 
-    args = parser.parse_args(argv)
-    regions = parse_list_argument(args.regions)
-    if not regions:
-        parser.error("At least one region must be specified via --regions")
-    factors = [normalise_factor_name(f) for f in parse_list_argument(args.factors)]
-    factors = [f for f in factors if f != "SWCRE"]
-    if not factors:
-        parser.error("No predictor factors specified")
+    sensitivities = np.full((len(FACTOR_NAMES), n_lat, n_lon), np.nan, dtype=float)
+    delta_r2 = np.full((len(FACTOR_NAMES), n_lat, n_lon), np.nan, dtype=float)
+    base_r2 = np.full((n_lat, n_lon), np.nan, dtype=float)
+    best_alpha = np.full((n_lat, n_lon), np.nan, dtype=float)
+    sample_count = np.zeros((n_lat, n_lon), dtype=int)
 
-    config = RegressionConfig(
-        method=args.method,
-        factors=factors,
-        hac_lags=args.hac_lags,
-        pcr_var=args.pcr_var,
-        standardize=args.standardize,
-        mbb=args.mbb,
-        mbb_block=args.mbb_block,
-        importance_block=args.importance_block,
-    )
+    rng = np.random.default_rng(args.seed)
+    alphas = sorted(parse_float_list(args.alphas))
+    if not alphas:
+        raise ValueError("At least one alpha value must be provided")
 
-    obs_dir = Path("output/regional_monthly")
-    cmip_csv = Path(args.cmip_csv)
-    rng = np.random.default_rng(1234)
+    lon_lat_mask_indices = np.argwhere(mask)
+    logger.info("Evaluating ridge models on %d ocean grid cells", lon_lat_mask_indices.shape[0])
 
-    try:
-        cmip_df = build_cmip_table(cmip_csv)
-    except Exception as exc:  # noqa: BLE001
-        print(f"Failed to load CMIP data: {exc}", file=sys.stderr)
-        return 2
-
-    for region in regions:
-        beta_tables: List[pd.DataFrame] = []
-        contrib_tables: List[pd.DataFrame] = []
-        feedback_entries: List[pd.Series] = []
-
-        log_path = Path("logs") / f"ccf_{region}_{config.method}_{args.season}.log"
-        logger = setup_logger(log_path)
-        logger.info("Starting analysis for region %s", region)
-
-        required = ["SWCRE"] + list(config.factors)
-        optional = ["LCF", "EIS", "Ts", "omega500", "RH700", "sstgrad", "u10", "v10"]
+    for lat_idx, lon_idx in lon_lat_mask_indices:
+        X_point = all_features[:, lat_idx, lon_idx, :]
+        y_point = target[:, lat_idx, lon_idx]
+        valid = np.isfinite(y_point) & np.all(np.isfinite(X_point), axis=1)
+        if valid.sum() < 24:  # require at least two years of monthly data
+            continue
+        X_valid = X_point[valid]
+        y_valid = y_point[valid]
+        groups = years[valid]
         try:
-            obs_df, _ = load_obs_dataset(region, required, optional, obs_dir, logger)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Skipping region %s due to observational data error: %s", region, exc)
+            splits = _prepare_cv_splits(groups)
+        except ValueError:
             continue
-
-        obs_anom = compute_monthly_anomalies(obs_df, [c for c in obs_df.columns if c != "time"])
-        obs_mask = season_mask(obs_anom["time"], args.season)
-        obs_subset = obs_anom.loc[obs_mask].dropna(subset=required)
-        n_obs = len(obs_subset)
-        logger.info("OBS sample size after filtering: %s", n_obs)
-
-        if args.dry_run:
-            print(f"[DRY-RUN] Region={region} dataset=OBS factors={config.factors} n={n_obs}")
-            print(obs_subset.head())
-        elif require_minimum_samples(n_obs, args.season):
-            X_obs = obs_subset[config.factors].to_numpy()
-            y_obs = obs_subset["SWCRE"].to_numpy()
-            if config.method == "MLR":
-                obs_result, _ = fit_mlr(y_obs, X_obs, config.factors, config)
-                base_r2 = obs_result.r2
-                delta = permutation_importance(
-                    y_obs,
-                    X_obs,
-                    config.factors,
-                    config,
-                    base_r2,
-                    lambda y, X, names: fit_func_mlr(y, X, names, config),
-                    rng,
-                )
-            else:
-                obs_result, info = fit_pcr(y_obs, X_obs, config.factors, config, rng)
-                logger.info(
-                    "OBS PCR retained PCs=%d (cumVar=%.2f)", info["k"], info["cumvar"]
-                )
-                base_r2 = obs_result.r2
-                delta = permutation_importance(
-                    y_obs,
-                    X_obs,
-                    config.factors,
-                    config,
-                    base_r2,
-                    lambda y, X, names: fit_func_pcr(y, X, names, config, rng),
-                    rng,
-                )
-            obs_result.dataset = "obs"
-            obs_result.model = "OBS"
-            obs_result.region = region
-            obs_result.season = args.season
-            beta_tables.append(
-                pd.DataFrame(
-                    [
-                        {
-                            "dataset": obs_result.dataset,
-                            "model": obs_result.model,
-                            "region": region,
-                            "season": args.season,
-                            "method": config.method,
-                            "factor": factor,
-                            "beta": obs_result.beta.get(factor, np.nan),
-                            "se": obs_result.se.get(factor, np.nan),
-                            "t": obs_result.tvalue.get(factor, np.nan),
-                            "p": obs_result.pvalue.get(factor, np.nan),
-                            "R2": obs_result.r2,
-                            "n": obs_result.n,
-                            "standardized": obs_result.standardized,
-                        }
-                        for factor in config.factors
-                    ]
-                )
-            )
-            contrib_tables.append(
-                pd.DataFrame(
-                    [
-                        {
-                            "dataset": "obs",
-                            "model": "OBS",
-                            "region": region,
-                            "season": args.season,
-                            "method": config.method,
-                            "factor": factor,
-                            "delta_R2": delta.get(factor, np.nan),
-                            "base_R2": base_r2,
-                            "n": n_obs,
-                        }
-                        for factor in config.factors
-                    ]
-                )
-            )
-            feedback = fit_feedback_chain(obs_df, logger, args.season, config.hac_lags)
-            if feedback:
-                feedback_entries.append(
-                    pd.Series(
-                        {
-                            "dataset": "obs",
-                            "model": "OBS",
-                            "region": region,
-                            "season": args.season,
-                            **feedback,
-                        }
-                    )
-                )
+        alpha, r2_base, _ = select_alpha(X_valid, y_valid, groups, alphas, splits)
+        coef, _, _, _ = fit_final_model(X_valid, y_valid, alpha)
+        best_alpha[lat_idx, lon_idx] = alpha
+        base_r2[lat_idx, lon_idx] = r2_base
+        sample_count[lat_idx, lon_idx] = int(valid.sum())
+        for factor_idx, factor in enumerate(FACTOR_NAMES):
+            start = factor_idx * (size * size)
+            end = (factor_idx + 1) * (size * size)
+            sensitivities[factor_idx, lat_idx, lon_idx] = coef[start:end].sum()
+        if args.shuffles > 0:
+            for factor_idx in range(len(FACTOR_NAMES)):
+                start = factor_idx * (size * size)
+                end = (factor_idx + 1) * (size * size)
+                permuted_deltas: List[float] = []
+                for _ in range(args.shuffles):
+                    perm_idx = block_permutation_indices(X_valid.shape[0], args.block, rng)
+                    permuted = X_valid.copy()
+                    permuted[:, start:end] = X_valid[perm_idx, start:end]
+                    r2_perm = cross_validated_r2(permuted, y_valid, splits, alpha)
+                    permuted_deltas.append(r2_base - r2_perm)
+                if permuted_deltas:
+                    delta_r2[factor_idx, lat_idx, lon_idx] = float(np.mean(permuted_deltas))
         else:
-            logger.warning("Insufficient OBS samples for regression; skipping region %s", region)
+            delta_r2[:, lat_idx, lon_idx] = np.nan
 
-        cmip_region = cmip_df[cmip_df["region"].str.upper() == region.upper()]
-        if cmip_region.empty:
-            logger.warning("No CMIP data found for region %s", region)
-        for model in sorted(cmip_region["model"].unique()):
-            model_df = cmip_region[cmip_region["model"] == model].copy()
-            available_factors = [f for f in config.factors if f in model_df.columns]
-            missing_factors = [f for f in config.factors if f not in available_factors]
-            if not available_factors:
-                logger.warning("Model %s lacks requested predictors; skipped", model)
-                continue
-            if missing_factors:
-                logger.warning(
-                    "Model %s missing predictors %s; proceeding with available factors",
-                    model,
-                    missing_factors,
-                )
-            feedback_cols = [c for c in ["LCF", "EIS", "Ts"] if c in model_df.columns]
-            model_raw = model_df[["time", "SWCRE"] + available_factors + feedback_cols]
-            model_anom = compute_monthly_anomalies(
-                model_df[["time", "SWCRE"] + available_factors],
-                ["SWCRE"] + available_factors,
-            )
-            mask = season_mask(model_anom["time"], args.season)
-            model_subset = model_anom.loc[mask].dropna(subset=["SWCRE"] + available_factors)
-            n_mod = len(model_subset)
-            if args.dry_run:
-                print(
-                    f"[DRY-RUN] Region={region} dataset=CMIP model={model} factors={available_factors} n={n_mod}"
-                )
-                print(model_subset.head())
-                continue
-            if not require_minimum_samples(n_mod, args.season):
-                logger.warning(
-                    "Model %s insufficient samples after filtering (n=%s); skipped",
-                    model,
-                    n_mod,
-                )
-                continue
-            X_mod = model_subset[available_factors].to_numpy()
-            y_mod = model_subset["SWCRE"].to_numpy()
-            if config.method == "MLR":
-                mod_result, _ = fit_mlr(y_mod, X_mod, available_factors, config)
-                base_r2 = mod_result.r2
-                delta_mod = permutation_importance(
-                    y_mod,
-                    X_mod,
-                    available_factors,
-                    config,
-                    base_r2,
-                    lambda y, X, names: fit_func_mlr(y, X, names, config),
-                    rng,
-                )
-            else:
-                mod_result, info = fit_pcr(y_mod, X_mod, available_factors, config, rng)
-                logger.info(
-                    "Model %s PCR retained PCs=%d (cumVar=%.2f)",
-                    model,
-                    info["k"],
-                    info["cumvar"],
-                )
-                base_r2 = mod_result.r2
-                delta_mod = permutation_importance(
-                    y_mod,
-                    X_mod,
-                    available_factors,
-                    config,
-                    base_r2,
-                    lambda y, X, names: fit_func_pcr(y, X, names, config, rng),
-                    rng,
-                )
-            mod_result.dataset = "cmip"
-            mod_result.model = model
-            mod_result.region = region
-            mod_result.season = args.season
-            beta_tables.append(
-                pd.DataFrame(
-                    [
-                        {
-                            "dataset": "cmip",
-                            "model": model,
-                            "region": region,
-                            "season": args.season,
-                            "method": config.method,
-                            "factor": factor,
-                            "beta": mod_result.beta.get(factor, np.nan),
-                            "se": mod_result.se.get(factor, np.nan),
-                            "t": mod_result.tvalue.get(factor, np.nan),
-                            "p": mod_result.pvalue.get(factor, np.nan),
-                            "R2": mod_result.r2,
-                            "n": mod_result.n,
-                            "standardized": mod_result.standardized,
-                        }
-                        for factor in available_factors
-                    ]
-                )
-            )
-            contrib_tables.append(
-                pd.DataFrame(
-                    [
-                        {
-                            "dataset": "cmip",
-                            "model": model,
-                            "region": region,
-                            "season": args.season,
-                            "method": config.method,
-                            "factor": factor,
-                            "delta_R2": delta_mod.get(factor, np.nan),
-                            "base_R2": base_r2,
-                            "n": n_mod,
-                        }
-                        for factor in available_factors
-                    ]
-                )
-            )
-            if all(c in model_raw.columns for c in ["LCF", "EIS", "Ts"]):
-                feedback = fit_feedback_chain(model_raw, logger, args.season, config.hac_lags)
-                if feedback:
-                    feedback_entries.append(
-                        pd.Series(
-                            {
-                                "dataset": "cmip",
-                                "model": model,
-                                "region": region,
-                                "season": args.season,
-                                **feedback,
-                            }
-                        )
-                    )
+    # Build xarray objects for output
+    coords = {"factor": list(FACTOR_NAMES), lat_name: lat, lon_name: lon}
+    sens_da = xr.DataArray(
+        sensitivities,
+        coords=coords,
+        dims=("factor", lat_name, lon_name),
+        name="sensitivity",
+    )
+    delta_da = xr.DataArray(
+        delta_r2,
+        coords=coords,
+        dims=("factor", lat_name, lon_name),
+        name="delta_r2",
+    )
+    r2_da = xr.DataArray(
+        base_r2,
+        coords={lat_name: lat, lon_name: lon},
+        dims=(lat_name, lon_name),
+        name="r2_base",
+    )
+    alpha_da = xr.DataArray(
+        best_alpha,
+        coords={lat_name: lat, lon_name: lon},
+        dims=(lat_name, lon_name),
+        name="alpha",
+    )
+    n_da = xr.DataArray(
+        sample_count,
+        coords={lat_name: lat, lon_name: lon},
+        dims=(lat_name, lon_name),
+        name="n_samples",
+    )
 
-        if args.dry_run:
-            continue
+    finite_r2 = base_r2[np.isfinite(base_r2)]
+    if finite_r2.size:
+        median_r2 = float(np.median(finite_r2))
+        p25 = float(np.percentile(finite_r2, 25))
+        p75 = float(np.percentile(finite_r2, 75))
+    else:
+        median_r2 = float("nan")
+        p25 = float("nan")
+        p75 = float("nan")
 
-        beta_df = pd.concat(beta_tables, ignore_index=True) if beta_tables else pd.DataFrame()
-        contrib_df = (
-            pd.concat(contrib_tables, ignore_index=True) if contrib_tables else pd.DataFrame()
-        )
-        feedback_df = (
-            pd.DataFrame(feedback_entries) if feedback_entries else pd.DataFrame()
+    valid_samples = sample_count[sample_count > 0]
+    if valid_samples.size:
+        sample_median = float(np.median(valid_samples))
+    else:
+        sample_median = float("nan")
+
+    logger.info(
+        "Seasonality %s: base R² median %.3f (25th=%.3f, 75th=%.3f)",
+        seasonality,
+        median_r2,
+        p25,
+        p75,
+    )
+    if not np.isnan(sample_median):
+        logger.info("Seasonality %s: median valid samples per grid %.1f", seasonality, sample_median)
+
+    out_dir = Path(args.out)
+    sens_path = out_dir / f"sensitivities_{seasonality.lower()}_{yvar}.nc"
+    delta_path = out_dir / f"deltaR2_{seasonality.lower()}_{yvar}.nc"
+    if not args.dry_run:
+        ensure_parent(sens_path)
+        ensure_parent(delta_path)
+        xr.Dataset(
+            {
+                "sensitivity": sens_da,
+                "alpha": alpha_da,
+                "r2_base": r2_da,
+                "n_samples": n_da,
+            }
+        ).to_netcdf(sens_path)
+        xr.Dataset({"delta_r2": delta_da}).to_netcdf(delta_path)
+
+    # Regional summaries
+    region_rows: List[Dict[str, object]] = []
+    delta_rows: List[Dict[str, object]] = []
+    r2_rows: List[Dict[str, object]] = []
+    for region, box in regions.items():
+        sens_region = area_weighted_mean(region_subset(sens_da, box))
+        delta_region = area_weighted_mean(region_subset(delta_da, box))
+        r2_region = area_weighted_mean(region_subset(r2_da, box))
+        for factor in FACTOR_NAMES:
+            region_rows.append(
+                {
+                    "region": region,
+                    "factor": factor,
+                    "seasonality": seasonality.upper(),
+                    "yvar": yvar,
+                    "sensitivity": float(sens_region.sel(factor=factor)),
+                    "base_r2": float(r2_region),
+                }
+            )
+            delta_rows.append(
+                {
+                    "region": region,
+                    "factor": factor,
+                    "seasonality": seasonality.upper(),
+                    "yvar": yvar,
+                    "delta_r2": float(delta_region.sel(factor=factor)),
+                }
+            )
+        r2_rows.append(
+            {
+                "region": region,
+                "seasonality": seasonality.upper(),
+                "yvar": yvar,
+                "base_r2": float(r2_region),
+            }
         )
 
-        if not beta_df.empty:
-            beta_path = Path("tables") / f"ccf_betas_{region}_{config.method}_{args.season}.csv"
-            ensure_output_dir(beta_path)
-            beta_df.to_csv(beta_path, index=False)
-            plot_betas(
-                beta_df,
-                Path("figures")
-                / f"ccf_betas_obs_vs_models_{region}_{config.method}_{args.season}.png",
-                region,
-                config.method,
-                args.season,
-            )
-        if not contrib_df.empty:
-            contrib_path = (
-                Path("tables") / f"ccf_contrib_{region}_{config.method}_{args.season}.csv"
-            )
-            ensure_output_dir(contrib_path)
-            contrib_df.to_csv(contrib_path, index=False)
-            plot_contributions(
-                contrib_df,
-                Path("figures")
-                / f"ccf_contrib_{region}_{config.method}_{args.season}.png",
-                region,
-                config.method,
-                args.season,
-            )
-        if not feedback_df.empty:
-            feedback_path = (
-                Path("tables") / f"ccf_feedback_decomp_{region}_{args.season}.csv"
-            )
-            ensure_output_dir(feedback_path)
-            feedback_df.to_csv(feedback_path, index=False)
-            plot_feedback(
-                feedback_df,
-                Path("figures")
-                / f"ccf_feedback_decomposition_{region}_{args.season}.png",
-                region,
-                args.season,
+    if not args.dry_run:
+        tables_dir = Path("tables")
+        tables_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = tables_dir / f"ccf_region_summary_{seasonality.lower()}_{yvar}.csv"
+        delta_csv_path = tables_dir / f"ccf_deltaR2_{seasonality.lower()}_{yvar}.csv"
+        base_csv_path = tables_dir / f"ccf_baseR2_{seasonality.lower()}_{yvar}.csv"
+        pd.DataFrame(region_rows).to_csv(summary_path, index=False)
+        pd.DataFrame(delta_rows).to_csv(delta_csv_path, index=False)
+        pd.DataFrame(r2_rows).drop_duplicates().to_csv(base_csv_path, index=False)
+
+    if not args.dry_run:
+        log_dir = Path("logs")
+        log_path = log_dir / f"ccf_analysis_{seasonality.lower()}_{yvar}.log"
+        ensure_parent(log_path)
+        with log_path.open("w", encoding="utf8") as log_file:
+            log_file.write(
+                f"Seasonality: {seasonality}\nTarget: {yvar}\n"
+                f"Grid cells evaluated: {int(np.isfinite(base_r2).sum())}\n"
+                f"Median R2: {median_r2:.3f}\n"
+                f"R2 IQR: {p25:.3f}–{p75:.3f}\n"
+                f"Sample count median: {sample_median:.1f}\n"
             )
 
-    return 0
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    seasonality_options = [args.seasonality.upper()]
+    if args.seasonality.upper() == "BOTH":
+        seasonality_options = ["SEASON", "DESEASON"]
+
+    regions = load_regions(parse_str_list(args.regions))
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger("ccf_analysis")
+
+    if args.cmip_csv:
+        cmip_path = Path(args.cmip_csv)
+        if cmip_path.exists():
+            logger.info("CMIP CSV provided: %s (%.1f MB)", cmip_path, cmip_path.stat().st_size / 1e6)
+        else:
+            logger.warning("CMIP CSV path does not exist: %s", cmip_path)
+
+    for seasonality in seasonality_options:
+        logger.info("Starting analysis for seasonality: %s", seasonality)
+        process_seasonality(args, seasonality, regions, logger)
+        logger.info("Completed analysis for seasonality: %s", seasonality)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
